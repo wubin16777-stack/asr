@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """字幕工作室  (需要系统里装好 ffmpeg, 导出MP4用)
   (DJ混音歌曲 -> 人声分离 -> 唱歌分类 -> 注入歌词的字级ASR)
-安装: pip install PySide6 requests numpy soundfile torch torchaudio demucs faster-whisper panns-inference librosa pypinyin
-运行: python subtitle_studio.py
+安装: pip install PySide6 requests numpy soundfile torch torchaudio demucs audio-separator faster-whisper panns-inference librosa pypinyin
+可选 ASR B: pip install funasr modelscope；ASR C: pip install -U qwen-asr（PyTorch/CUDA 请按本机环境单独配置）
+运行: python subtitle_studio_singing_only.py
 """
-import sys, os, re, glob, math, html, json, subprocess, tempfile, difflib
+import sys, os, re, glob, math, html, json, subprocess, tempfile, difflib, hashlib, hmac, zlib, time, uuid, datetime
 import requests
 from dataclasses import dataclass, field
 import numpy as np
@@ -39,6 +40,9 @@ STYLE["title_style"].setdefault("gradient_angle",45.0); STYLE["title_style"].set
 STYLE["title_style"].setdefault("letter_spacing",0.0)
 STYLE["title_style"].setdefault("loop_anim","无"); STYLE["title_style"].setdefault("loop_speed",1.0); STYLE["title_style"].setdefault("stay",0.0); STYLE["title_style"].setdefault("interval",0.0)
 STYLE.setdefault("theme", "专业深色")
+STYLE.setdefault("vocal_model", "A")
+STYLE.setdefault("asr_engine", "A")
+STYLE.setdefault("asr_models", {"A": "large-v3", "B": "paraformer-zh", "C": "0.6B", "D": "cloud-default"})
 STYLE.setdefault("layout_mode", "横排")
 STYLE.setdefault("current_scale", 30); STYLE.setdefault("other_opacity", 65)
 STYLE.setdefault("in_anim", "淡入"); STYLE.setdefault("in_speed", 1.0)
@@ -48,6 +52,996 @@ STYLE.setdefault("current_row", "循环")
 STYLE.setdefault("lyric_slots", [{"enabled": i < 3, "x": 0.5, "y": 0.68+i*0.09, "angle": 0.0} for i in range(5)])
 while len(STYLE["lyric_slots"]) < 5: STYLE["lyric_slots"].append({"enabled":False,"x":0.5,"y":0.5,"angle":0.0})
 for _slot in STYLE["lyric_slots"]: _slot.pop("current", None)
+
+# 人声分离模型保存在用户数据目录；A 的权重放入 PyTorch Hub 缓存，
+# 这样原有的 `python -m demucs` 命令可以直接复用，不会再次下载。
+APP_MODEL_DIR = os.path.join(os.path.expanduser("~"), ".subtitle_studio", "models")
+DEMUCS_CHECKPOINT = "955717e8-8726e21a.th"
+DEMUCS_CONFIG = "htdemucs.yaml"
+
+
+def _demucs_checkpoint_path():
+    torch_home = os.environ.get("TORCH_HOME")
+    if not torch_home:
+        cache_home = os.environ.get("XDG_CACHE_HOME", os.path.join(os.path.expanduser("~"), ".cache"))
+        torch_home = os.path.join(cache_home, "torch")
+    return os.path.join(torch_home, "hub", "checkpoints", DEMUCS_CHECKPOINT)
+
+
+VOCAL_MODELS = {
+    "A": {
+        "description": "原有方案：通用均衡、兼容稳定，适合作为默认选择。",
+        "color": "#19A974",
+        "assets": [
+            {"kind": "权重", "filename": DEMUCS_CHECKPOINT, "scope": "torch",
+             "urls": [
+                 "https://dl.fbaipublicfiles.com/demucs/hybrid_transformer/955717e8-8726e21a.th",
+                 "https://huggingface.co/Politrees/UVR_resources/resolve/main/Demucs_models/955717e8-8726e21a.th?download=true",
+                 "https://hf-mirror.com/Politrees/UVR_resources/resolve/main/Demucs_models/955717e8-8726e21a.th?download=true",
+             ], "size_hint": 84_100_000, "min_size": 80_000_000, "sha256_prefix": "8726e21a"},
+            {"kind": "配置", "filename": DEMUCS_CONFIG, "scope": "app",
+             "urls": [
+                 "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/htdemucs.yaml",
+                 "https://huggingface.co/Politrees/UVR_resources/resolve/main/Demucs_models/htdemucs.yaml?download=true",
+                 "https://hf-mirror.com/Politrees/UVR_resources/resolve/main/Demucs_models/htdemucs.yaml?download=true",
+             ], "size_hint": 4096, "min_size": 10, "required": False},
+        ],
+    },
+    "B": {
+        "description": "人声修复取向，可尝试恢复旧录音或较模糊的人声细节。",
+        "color": "#8B5CF6",
+        "assets": [
+            {"kind": "权重", "filename": "BS-Roformer-Resurrection.ckpt", "scope": "app",
+             "urls": [
+                 "https://huggingface.co/pcunwa/BS-Roformer-Resurrection/resolve/main/BS-Roformer-Resurrection.ckpt?download=true",
+                 "https://hf-mirror.com/pcunwa/BS-Roformer-Resurrection/resolve/main/BS-Roformer-Resurrection.ckpt?download=true",
+                 "https://huggingface.co/pcunwa/BS-Roformer-Resurrection/resolve/main/BS-Roformer-Resurrection.ckpt",
+             ], "size_hint": 215_000_000, "min_size": 150_000_000,
+             "sha256": "9dbfe5cb572e4ed32a15ec727d7bd06c8d7aba97509e6fda5bc008bb1e0b2dd5"},
+            {"kind": "配置", "filename": "BS-Roformer-Resurrection-Config.yaml", "scope": "app",
+             "urls": [
+                 "https://huggingface.co/pcunwa/BS-Roformer-Resurrection/resolve/main/BS-Roformer-Resurrection-Config.yaml?download=true",
+                 "https://hf-mirror.com/pcunwa/BS-Roformer-Resurrection/resolve/main/BS-Roformer-Resurrection-Config.yaml?download=true",
+                 "https://huggingface.co/pcunwa/BS-Roformer-Resurrection/resolve/main/BS-Roformer-Resurrection-Config.yaml",
+             ], "size_hint": 4096, "min_size": 200},
+        ],
+    },
+    "C": {
+        "description": "高质量通用分离，细节保留较好；处理较慢且更占内存/显存。",
+        "color": "#168BCE",
+        "assets": [
+            {"kind": "权重", "filename": "model_bs_roformer_ep_317_sdr_12.9755.ckpt", "scope": "app",
+             "urls": [
+                 "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+                 "https://huggingface.co/Eddycrack864/Music-Source-Separation-Training/resolve/main/model_bs_roformer_ep_317_sdr_12.9755.ckpt?download=true",
+                 "https://huggingface.co/datasets/SayanoAI/RVC-Studio/resolve/main/UVR/model_bs_roformer_ep_317_sdr_12.9755.ckpt?download=true",
+                 "https://hf-mirror.com/Eddycrack864/Music-Source-Separation-Training/resolve/main/model_bs_roformer_ep_317_sdr_12.9755.ckpt?download=true",
+             ], "size_hint": 670_000_000, "min_size": 500_000_000,
+             "sha256": "5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa"},
+            {"kind": "配置", "filename": "model_bs_roformer_ep_317_sdr_12.9755.yaml", "scope": "app",
+             "urls": [
+                 "https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml",
+                 "https://huggingface.co/Eddycrack864/Music-Source-Separation-Training/resolve/main/model_bs_roformer_ep_317_sdr_12.9755.yaml?download=true",
+                 "https://hf-mirror.com/Eddycrack864/Music-Source-Separation-Training/resolve/main/model_bs_roformer_ep_317_sdr_12.9755.yaml?download=true",
+             ], "size_hint": 4096, "min_size": 200},
+        ],
+    },
+}
+
+
+def _model_asset_path(model_key, asset):
+    if asset.get("scope") == "torch":
+        return _demucs_checkpoint_path()
+    return os.path.join(APP_MODEL_DIR, asset["filename"])
+
+
+def _model_asset_is_ready(model_key, asset):
+    path = _model_asset_path(model_key, asset)
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) >= asset.get("min_size", 1)
+    except OSError:
+        return False
+
+
+def is_vocal_model_downloaded(model_key):
+    if model_key not in VOCAL_MODELS:
+        return False
+    return all(_model_asset_is_ready(model_key, asset)
+               for asset in VOCAL_MODELS[model_key]["assets"] if asset.get("required", True))
+
+
+# ASR 选择与模型清单。B 选 FunASR Paraformer-zh（中文/英文、CPU可运行并可返回字级时间戳）；
+# C 默认 Qwen3-ASR-0.6B（多语种且面向歌曲），同时下载官方 ForcedAligner 以保留逐字时间戳。
+# 模型目录位于用户数据区；所有下载走 ModelScope、Hugging Face、hf-mirror 三路回退。
+STYLE.setdefault("asr_engine", "A")
+STYLE.setdefault("asr_models", {"A": "large-v3", "B": "paraformer-zh", "C": "0.6B", "D": "cloud-default"})
+ASR_ENGINE_ORDER = ("A", "B", "C", "D")
+ASR_DEFAULT_MODELS = {"A": "large-v3", "B": "paraformer-zh", "C": "0.6B", "D": "cloud-default"}
+ASR_ENGINE_DESCRIPTIONS = {
+    "A": "现有 Faster-Whisper：多语种、稳定；large-v3 精度较好，turbo 更快、省显存。",
+    "B": "FunASR Paraformer-zh：中文/英文表现均衡，体积适中，CPU 可运行并带字符时间戳。",
+    "C": "Qwen3-ASR：支持多语种及歌曲识别；配套强制对齐模型生成逐字时间。",
+    "D": "剪映云端接口：不下载本地模型；人声音频将上传至字节跳动相关服务。",
+}
+ASR_MODEL_CHOICES = {
+    "A": [("large-v3", "large-v3 · 精度优先（约 3.1 GB）"),
+          ("large-v3-turbo", "large-v3-turbo · 更快省显存（约 1.6 GB）")],
+    "B": [("paraformer-zh", "Paraformer-zh · 中文推荐（约 0.9 GB）")],
+    "C": [("0.6B", "Qwen3-ASR-0.6B · 轻量推荐（另含对齐模型）"),
+          ("1.7B", "Qwen3-ASR-1.7B · 高精度/高资源（另含对齐模型）")],
+    "D": [("cloud-default", "剪映云端默认识别（无本地权重）")],
+}
+ASR_MODEL_DIR = os.path.join(APP_MODEL_DIR, "asr")
+
+
+def _ms_source(repo, revision="master"):
+    return {"kind": "modelscope", "repo": repo, "revision": revision,
+            "base": "https://modelscope.cn"}
+
+
+def _hf_source(repo, base="https://huggingface.co", revision="main"):
+    return {"kind": "hf", "repo": repo, "revision": revision, "base": base}
+
+
+ASR_MODEL_SPECS = {
+    "A": {
+        "large-v3": {"kind": "whisper", "repo": "Systran/faster-whisper-large-v3", "approx": "3.1 GB",
+                     "sources": [_ms_source("Systran/faster-whisper-large-v3"),
+                                 _hf_source("Systran/faster-whisper-large-v3"),
+                                 _hf_source("Systran/faster-whisper-large-v3", "https://hf-mirror.com")]},
+        "large-v3-turbo": {"kind": "whisper", "repo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo", "approx": "1.6 GB",
+                            "sources": [_ms_source("mobiuslabsgmbh/faster-whisper-large-v3-turbo"),
+                                        _hf_source("mobiuslabsgmbh/faster-whisper-large-v3-turbo"),
+                                        _hf_source("mobiuslabsgmbh/faster-whisper-large-v3-turbo", "https://hf-mirror.com")]},
+    },
+    "B": {
+        "paraformer-zh": {"kind": "funasr", "repo": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch", "approx": "0.9 GB",
+                          "sources": [_ms_source("iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"),
+                                      _hf_source("funasr/paraformer-zh"),
+                                      _hf_source("funasr/paraformer-zh", "https://hf-mirror.com")]},
+    },
+    "C": {
+        "0.6B": {"kind": "qwen", "repo": "Qwen/Qwen3-ASR-0.6B", "approx": "约 1.9 GB + 对齐模型",
+                 "sources": [_ms_source("Qwen/Qwen3-ASR-0.6B"), _hf_source("Qwen/Qwen3-ASR-0.6B"),
+                             _hf_source("Qwen/Qwen3-ASR-0.6B", "https://hf-mirror.com")]},
+        "1.7B": {"kind": "qwen", "repo": "Qwen/Qwen3-ASR-1.7B", "approx": "约 3.8 GB + 对齐模型",
+                 "sources": [_ms_source("Qwen/Qwen3-ASR-1.7B"), _hf_source("Qwen/Qwen3-ASR-1.7B"),
+                             _hf_source("Qwen/Qwen3-ASR-1.7B", "https://hf-mirror.com")]},
+    },
+}
+QWEN_ALIGNER_SPEC = {
+    "kind": "qwen", "repo": "Qwen/Qwen3-ForcedAligner-0.6B", "approx": "对齐模型",
+    "sources": [_ms_source("Qwen/Qwen3-ForcedAligner-0.6B"),
+                _hf_source("Qwen/Qwen3-ForcedAligner-0.6B"),
+                _hf_source("Qwen/Qwen3-ForcedAligner-0.6B", "https://hf-mirror.com")],
+}
+
+
+def _asr_model_key(engine, value=None):
+    choices = {key for key, _ in ASR_MODEL_CHOICES.get(engine, [])}
+    saved = STYLE.get("asr_models", {})
+    if value is None and isinstance(saved, dict):
+        value = saved.get(engine)
+    return value if value in choices else ASR_DEFAULT_MODELS.get(engine, "")
+
+
+def _asr_model_path(engine, model_key):
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(model_key))
+    return os.path.join(ASR_MODEL_DIR, engine, safe_key)
+
+
+def _qwen_aligner_path():
+    return os.path.join(ASR_MODEL_DIR, "C", "Qwen3-ForcedAligner-0.6B")
+
+
+def _asr_checkpoint_path(engine, model_key, spec=None):
+    if spec is None:
+        spec = ASR_MODEL_SPECS[engine][model_key]
+    return _qwen_aligner_path() if spec is QWEN_ALIGNER_SPEC else _asr_model_path(engine, model_key)
+
+
+def _asr_file_selected(kind, path):
+    path = str(path).replace("\\", "/")
+    name = path.rsplit("/", 1)[-1]
+    low = name.lower()
+    if low in ("readme.md", ".gitattributes") or "/example/" in f"/{path.lower()}/" or "/fig/" in f"/{path.lower()}/":
+        return False
+    if kind == "whisper":
+        return low in {"config.json", "preprocessor_config.json", "model.bin", "tokenizer.json"} or low.startswith("vocabulary.")
+    if kind == "funasr":
+        return name in {"am.mvn", "config.yaml", "configuration.json", "model.pt", "tokens.json", "seg_dict"}
+    if kind == "qwen":
+        return low.endswith((".json", ".txt", ".model", ".safetensors"))
+    return False
+
+
+def _asr_manifest_has_required(kind, files):
+    names = {item["path"].rsplit("/", 1)[-1] for item in files}
+    weights = [n for n in names if n.endswith((".bin", ".pt", ".safetensors")) or n.startswith("model-")]
+    if kind == "whisper":
+        return {"config.json", "preprocessor_config.json", "model.bin", "tokenizer.json"}.issubset(names)
+    if kind == "funasr":
+        return {"am.mvn", "config.yaml", "configuration.json", "model.pt", "tokens.json"}.issubset(names)
+    if kind == "qwen":
+        return "config.json" in names and bool(weights)
+    return False
+
+
+def _asr_source_manifest(source, kind):
+    repo = source["repo"]
+    revision = source["revision"]
+    base = source["base"].rstrip("/")
+    if source["kind"] == "modelscope":
+        url = f"{base}/api/v1/models/{repo}/repo/files?Revision={revision}&Recursive=true"
+        response = requests.get(url, headers=UA, timeout=(10, 20))
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("Success") and data.get("Code") != 200:
+            raise RuntimeError(data.get("Message") or "ModelScope 未返回模型文件清单")
+        entries = (data.get("Data") or {}).get("Files") or []
+        files = []
+        for entry in entries:
+            if entry.get("Type") != "blob":
+                continue
+            path = entry.get("Path") or entry.get("Name")
+            if not path or not _asr_file_selected(kind, path):
+                continue
+            files.append({"path": path, "size": int(entry.get("Size") or 0),
+                          "sha256": str(entry.get("Sha256") or "").lower()})
+    else:
+        url = f"{base}/api/models/{repo}/tree/{revision}?recursive=true&expand=true&limit=1000"
+        response = requests.get(url, headers=UA, timeout=(10, 20))
+        response.raise_for_status()
+        entries = response.json()
+        files = []
+        for entry in entries:
+            if entry.get("type") != "file":
+                continue
+            path = entry.get("path")
+            if not path or not _asr_file_selected(kind, path):
+                continue
+            lfs = entry.get("lfs") or {}
+            sha256 = str(lfs.get("oid") or "").lower()
+            if not sha256 and len(str(entry.get("oid") or "")) == 64:
+                sha256 = str(entry.get("oid")).lower()
+            files.append({"path": path, "size": int(entry.get("size") or lfs.get("size") or 0),
+                          "sha256": sha256})
+    files = [item for item in files if item["size"] >= 0]
+    if not _asr_manifest_has_required(kind, files):
+        raise RuntimeError(f"模型仓库 {repo} 缺少必需权重或配置文件")
+    files.sort(key=lambda item: (0 if item["path"].rsplit("/", 1)[-1].lower().endswith((".bin", ".pt", ".safetensors")) else 1,
+                                 item["path"]))
+    return files
+
+
+def _asr_file_url(source, path):
+    from urllib.parse import quote
+    repo = source["repo"]
+    revision = source["revision"]
+    encoded_path = quote(path, safe="/")
+    if source["kind"] == "modelscope":
+        return f"{source['base'].rstrip('/')}/models/{repo}/resolve/{revision}/{encoded_path}"
+    return f"{source['base'].rstrip('/')}/{repo}/resolve/{revision}/{encoded_path}?download=true"
+
+
+def _asr_required_files(kind, files):
+    names = {item["path"].rsplit("/", 1)[-1] for item in files}
+    if kind == "whisper":
+        return {"config.json", "preprocessor_config.json", "model.bin", "tokenizer.json"}.issubset(names)
+    if kind == "funasr":
+        return {"am.mvn", "config.yaml", "configuration.json", "model.pt", "tokens.json"}.issubset(names)
+    weights = any(name.endswith((".bin", ".pt", ".safetensors")) or name.startswith("model-") for name in names)
+    return "config.json" in names and weights
+
+
+def _asr_checkpoint_ready(path, kind):
+    marker = os.path.join(path, ".download_complete.json")
+    if not os.path.isfile(marker):
+        return False
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        files = manifest.get("files") or []
+        if not _asr_required_files(kind, files):
+            return False
+        for item in files:
+            filename = item.get("path")
+            if not filename:
+                return False
+            local = os.path.join(path, *str(filename).replace("\\", "/").split("/"))
+            if not os.path.isfile(local):
+                return False
+            expected_size = int(item.get("size") or 0)
+            actual_size = os.path.getsize(local)
+            if (expected_size and actual_size != expected_size) or (not expected_size and actual_size <= 0):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _find_hf_cached_snapshot(repo, kind):
+    """复用 Faster-Whisper 旧版本下载到 Hugging Face 默认缓存中的权重。"""
+    cache_roots=[]
+    for env_name in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(env_name): cache_roots.append(os.path.expanduser(os.environ[env_name]))
+    if os.environ.get("HF_HOME"):
+        cache_roots.append(os.path.join(os.path.expanduser(os.environ["HF_HOME"]), "hub"))
+    cache_roots.append(os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+    cache_repo="models--"+repo.replace("/","--")
+    for cache_root in dict.fromkeys(cache_roots):
+        snapshot_root=os.path.join(cache_root,cache_repo,"snapshots")
+        snapshots=sorted(glob.glob(os.path.join(snapshot_root,"*")),key=lambda p:os.path.getmtime(p),reverse=True)
+        for snapshot in snapshots:
+            try:
+                names={os.path.basename(p) for p in glob.glob(os.path.join(snapshot,"*")) if os.path.isfile(p)}
+                if _asr_manifest_has_required(kind,[{"path":name} for name in names]):
+                    return snapshot
+            except OSError:
+                continue
+    return None
+
+
+def resolved_asr_model_path(engine, model_key):
+    local=_asr_model_path(engine,model_key)
+    spec=ASR_MODEL_SPECS.get(engine,{}).get(model_key,{})
+    if _asr_checkpoint_ready(local,spec.get("kind","")):
+        return local
+    if engine=="A" and spec.get("repo"):
+        return _find_hf_cached_snapshot(spec["repo"],spec["kind"]) or local
+    return local
+
+
+def is_asr_model_downloaded(engine, model_key):
+    if engine not in ASR_MODEL_SPECS or model_key not in ASR_MODEL_SPECS[engine]:
+        return False
+    spec = ASR_MODEL_SPECS[engine][model_key]
+    ready=_asr_checkpoint_ready(_asr_model_path(engine, model_key), spec["kind"])
+    if not ready and engine=="A":
+        ready=_find_hf_cached_snapshot(spec["repo"],spec["kind"]) is not None
+    if not ready:
+        return False
+    return engine != "C" or _asr_checkpoint_ready(_qwen_aligner_path(), "qwen")
+
+
+def any_local_asr_model_downloaded():
+    return any(is_asr_model_downloaded(engine, model_key)
+               for engine in ("A", "B", "C")
+               for model_key, _ in ASR_MODEL_CHOICES[engine])
+
+
+class ASRModelDownloadWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, engine, model_key, parent=None):
+        super().__init__(parent)
+        self.engine, self.model_key = engine, model_key
+
+    def _plans_for_checkpoint(self, destination, spec):
+        valid_sources, errors = [], []
+        for index, source in enumerate(spec["sources"], 1):
+            self.status.emit(f"读取模型清单：备用源 {index}/{len(spec['sources'])}（{source['base']}）")
+            try:
+                files = _asr_source_manifest(source, spec["kind"])
+                valid_sources.append((source, {item["path"]: item for item in files}))
+            except Exception as ex:
+                errors.append(f"{source['base']}: {ex}")
+        if not valid_sources:
+            raise RuntimeError("无法取得模型文件清单，已尝试 ModelScope、Hugging Face 和镜像：\n" + "\n".join(errors))
+        primary_source, primary_files = valid_sources[0]
+        plans = []
+        for path, item in primary_files.items():
+            # 即使某镜像的清单 API 暂时不可用，下载阶段仍会直接尝试它的同路径文件。
+            # 由主清单的长度/SHA-256 校验，错误版本会被拒绝后自动走下一条链接。
+            backups = []
+            for source in spec["sources"]:
+                source_manifest = next((manifest for known_source, manifest in valid_sources if known_source == source), {})
+                backups.append((source, source_manifest.get(path, item)))
+            plans.append({"path": path, "size": int(item.get("size") or 0),
+                          "sha256": item.get("sha256") or "", "sources": backups})
+        if not _asr_required_files(spec["kind"], plans):
+            raise RuntimeError(f"首选源 {primary_source['base']} 没有提供完整的模型文件")
+        return plans
+
+    def _download_file(self, destination, file_info, completed_bytes, total_bytes):
+        part = destination + ".part"
+        errors = []
+        sources = file_info["sources"]
+        expected_size = int(file_info.get("size") or 0)
+        expected_hash = str(file_info.get("sha256") or "").lower()
+        for index, (source, source_file) in enumerate(sources, 1):
+            try:
+                if os.path.exists(part):
+                    os.remove(part)
+                url = _asr_file_url(source, file_info["path"])
+                with requests.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "identity"},
+                                  stream=True, allow_redirects=True, timeout=(25, 120)) as response:
+                    response.raise_for_status()
+                    content_length = int(response.headers.get("Content-Length") or 0)
+                    target_size = expected_size or int(source_file.get("size") or content_length or 0)
+                    received, digest = 0, hashlib.sha256()
+                    with open(part, "wb") as output:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            output.write(chunk)
+                            digest.update(chunk)
+                            received += len(chunk)
+                            if total_bytes > 0:
+                                cur = min(target_size or received, received)
+                                pct = int((completed_bytes + cur) * 100 / total_bytes)
+                                self.progress.emit(max(0, min(99, pct)))
+                    if content_length and received != content_length:
+                        raise IOError(f"网络传输不完整（{received}/{content_length} 字节）")
+                if expected_size and received != expected_size:
+                    raise IOError(f"文件大小校验失败（{received}/{expected_size} 字节）")
+                if not expected_size and int(source_file.get("size") or 0) and received != int(source_file["size"]):
+                    raise IOError("备用源文件大小与清单不一致")
+                actual_hash = digest.hexdigest().lower()
+                if expected_hash and actual_hash != expected_hash:
+                    raise IOError("SHA-256 校验失败")
+                with open(part, "rb") as f:
+                    header = f.read(512).lstrip().lower()
+                if header.startswith((b"<!doctype html", b"<html", b"version https://git-lfs.github.com/spec/v1")):
+                    raise IOError("下载地址返回了网页或 LFS 指针，不是模型权重")
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                os.replace(part, destination)
+                if total_bytes > 0:
+                    self.progress.emit(min(99, int((completed_bytes + (expected_size or received)) * 100 / total_bytes)))
+                return
+            except Exception as ex:
+                errors.append(f"备用链接 {index}/{len(sources)}（{source['base']}）：{ex}")
+                try:
+                    if os.path.exists(part):
+                        os.remove(part)
+                except OSError:
+                    pass
+        raise RuntimeError(f"文件 {file_info['path']} 的所有备用链接均失败：\n" + "\n".join(errors))
+
+    def _download_checkpoint(self, destination, spec, title, plans, progress_state):
+        if _asr_checkpoint_ready(destination, spec["kind"]):
+            return
+        os.makedirs(destination, exist_ok=True)
+        for index, item in enumerate(plans, 1):
+            filename = os.path.join(destination, *item["path"].replace("\\", "/").split("/"))
+            root = os.path.abspath(destination)
+            if os.path.commonpath([root, os.path.abspath(filename)]) != root:
+                raise RuntimeError("模型清单包含非法路径，已停止下载。")
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            expected_size = int(item.get("size") or 0)
+            if os.path.isfile(filename) and (not expected_size or os.path.getsize(filename) == expected_size):
+                progress_state["done"] += expected_size or os.path.getsize(filename)
+                if progress_state["total"]:
+                    self.progress.emit(min(99, int(progress_state["done"] * 100 / progress_state["total"])))
+                continue
+            self.status.emit(f"{title}：下载 {index}/{len(plans)} · {item['path']}")
+            self._download_file(filename, item, progress_state["done"], progress_state["total"])
+            progress_state["done"] += expected_size or os.path.getsize(filename)
+        # 只有权重和配置全部成功后才写完成标记，防止半下载文件被当成可用模型。
+        marker = os.path.join(destination, ".download_complete.json")
+        temporary = marker + ".part"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump({"files": plans, "kind": spec["kind"], "repo": spec.get("repo", "")}, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, marker)
+        if not _asr_checkpoint_ready(destination, spec["kind"]):
+            raise RuntimeError(f"{title} 下载后完整性检查失败。")
+
+    def run(self):
+        try:
+            os.makedirs(ASR_MODEL_DIR, exist_ok=True)
+            spec = ASR_MODEL_SPECS[self.engine][self.model_key]
+            checkpoints = [(_asr_model_path(self.engine, self.model_key), spec, f"{self.engine}/{self.model_key}")]
+            if self.engine == "C":
+                checkpoints.append((_qwen_aligner_path(), QWEN_ALIGNER_SPEC, "Qwen3 ForcedAligner-0.6B"))
+            planned = []
+            for destination, checkpoint_spec, title in checkpoints:
+                if _asr_checkpoint_ready(destination, checkpoint_spec["kind"]):
+                    continue
+                self.status.emit(f"{title}：检查备用源并准备下载清单…")
+                files = self._plans_for_checkpoint(destination, checkpoint_spec)
+                planned.append((destination, checkpoint_spec, title, files))
+            total_bytes = sum(sum(int(item.get("size") or 0) for item in files)
+                              for _destination, _spec, _title, files in planned)
+            state = {"done": 0, "total": max(1, total_bytes)}
+            for destination, checkpoint_spec, title, files in planned:
+                self._download_checkpoint(destination, checkpoint_spec, title, files, state)
+            if not is_asr_model_downloaded(self.engine, self.model_key):
+                raise RuntimeError("ASR 权重/配置未完整下载，请重试。")
+            self.progress.emit(100)
+            self.completed.emit(f"识别模型 {self.engine}/{self.model_key} 已下载并可用。")
+        except Exception as ex:
+            self.failed.emit(str(ex))
+
+
+class GPUDetectWorker(QThread):
+    detected = Signal(str, object)
+
+    def run(self):
+        info = {"cuda": False, "name": "", "vram_gb": 0.0, "torch_device": "cpu", "detail": ""}
+        try:
+            result = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                                    capture_output=True, text=True, timeout=4)
+            if result.returncode == 0 and result.stdout.strip():
+                first = result.stdout.strip().splitlines()[0].split(",", 1)
+                info["name"] = first[0].strip()
+                if len(first) > 1:
+                    info["vram_gb"] = round(float(first[1].strip()) / 1024, 1)
+        except Exception:
+            pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                info["cuda"] = True
+                info["torch_device"] = "cuda:0"
+                info["name"] = torch.cuda.get_device_name(0) or info["name"] or "可用 GPU"
+                info["vram_gb"] = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 3), 1)
+                info["detail"] = f"PyTorch CUDA 可用，显存约 {info['vram_gb']:.1f} GB。"
+            elif info["name"]:
+                info["detail"] = "检测到 NVIDIA 显卡，但当前 PyTorch 未启用 CUDA；识别将回退 CPU，不会自动替换显卡驱动或 PyTorch。"
+            else:
+                info["detail"] = "未检测到可用的 NVIDIA CUDA 显卡，识别将使用 CPU。"
+        except Exception as ex:
+            info["detail"] = f"无法读取 PyTorch GPU 状态（{ex}）；识别会尝试使用 CPU。"
+        self.detected.emit(info["detail"], info)
+
+
+def _jianying_sign_parameters(api_path, tdid):
+    """AsrTools 的非官方剪映流程通过公开项目所用的签名中转服务取签名；不采集本机 MAC。"""
+    device_time = str(int(time.time()))
+    payload = {"url": api_path, "current_time": device_time, "pf": "4", "appvr": "4.0.0", "tdid": tdid}
+    response = requests.post("https://asrtools-update.bkfeng.top/sign", json=payload,
+                             headers=UA, timeout=(15, 30))
+    response.raise_for_status()
+    sign = (response.json() or {}).get("sign")
+    if not sign:
+        raise RuntimeError("剪映签名服务没有返回 sign 字段。")
+    return str(sign).lower(), device_time
+
+
+def _jianying_headers(api_path, tdid):
+    sign, device_time = _jianying_sign_parameters(api_path, tdid)
+    return {"User-Agent": "Cronet/TTNetVersion:01594da2 2023-03-14 QuicVersion:46688bb4 2022-11-28",
+            "appvr": "4.0.0", "device-time": device_time, "pf": "4", "sign": sign,
+            "sign-ver": "1", "tdid": tdid}
+
+
+def _jianying_aws_signature(secret_key, query, headers, method="GET", payload="", region="cn", service="vod"):
+    def _sign(key, message):
+        return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
+    date_stamp = headers["x-amz-date"].split("T")[0]
+    canonical_headers = "\n".join(f"{key}:{value}" for key, value in headers.items()) + "\n"
+    signed_headers = ";".join(headers.keys())
+    canonical_request = (f"{method}\n/\n{query}\n{canonical_headers}\n{signed_headers}\n"
+                        f"{hashlib.sha256(payload.encode('utf-8')).hexdigest()}")
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = (f"AWS4-HMAC-SHA256\n{headers['x-amz-date']}\n{scope}\n"
+                      f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}")
+    date_key = _sign(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    region_key = _sign(date_key, region)
+    service_key = _sign(region_key, service)
+    signing_key = _sign(service_key, "aws4_request")
+    return hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _jianying_response_json(response, operation):
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except Exception as ex:
+        raise RuntimeError(f"剪映接口{operation}返回了无法解析的响应。") from ex
+    if not isinstance(data, dict):
+        raise RuntimeError(f"剪映接口{operation}返回格式异常。")
+    return data
+
+
+def run_jianying_asr(audio_path, singing_segments, audio_duration, progress_callback=None):
+    """可选的非官方剪映云端 ASR。调用前 GUI 必须向用户展示上传告知并取得本次确认。"""
+    progress_callback = progress_callback or (lambda _value, _text: None)
+    if not os.path.isfile(audio_path):
+        raise RuntimeError("找不到用于剪映识别的人声音频文件。")
+    size = os.path.getsize(audio_path)
+    if size <= 0:
+        raise RuntimeError("人声音频文件为空。")
+
+    # 复用 AsrTools 示例使用的公开固定设备标识，避免将本机 MAC/硬件序列号发送给第三方。
+    tdid = "3943278516897751"
+    progress_callback(51, "剪映云端：计算校验值…")
+    crc = 0
+    with open(audio_path, "rb") as source:
+        while True:
+            block = source.read(4 * 1024 * 1024)
+            if not block:
+                break
+            crc = zlib.crc32(block, crc)
+    crc_hex = f"{crc & 0xFFFFFFFF:08x}"
+
+    # 第一步：从剪映接口取得一次性上传签名和临时凭证。
+    progress_callback(53, "剪映云端：申请临时上传凭证…")
+    sign_headers = _jianying_headers("/lv/v1/upload_sign", tdid)
+    upload_sign = requests.post(
+        "https://lv-pc-api-sinfonlinec.ulikecam.com/lv/v1/upload_sign",
+        data=json.dumps({"biz": "pc-recognition"}), headers=sign_headers, timeout=(20, 45))
+    sign_data = _jianying_response_json(upload_sign, "上传签名申请").get("data") or {}
+    access_key = sign_data.get("access_key_id")
+    secret_key = sign_data.get("secret_access_key")
+    session_token = sign_data.get("session_token")
+    if not all((access_key, secret_key, session_token)):
+        raise RuntimeError("剪映接口没有返回完整的临时上传凭证。")
+
+    query = (f"Action=ApplyUploadInner&FileSize={size}&FileType=object&IsInner=1&"
+             "SpaceName=lv-mac-recognition&Version=2020-11-19&s=5y0udbjapi")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    aws_headers = {"x-amz-date": amz_date, "x-amz-security-token": session_token}
+    signature = _jianying_aws_signature(secret_key, query, aws_headers)
+    aws_headers["authorization"] = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{date_stamp}/cn/vod/aws4_request,"
+        f" SignedHeaders=x-amz-date;x-amz-security-token, Signature={signature}")
+    auth_response = requests.get(f"https://vod.bytedanceapi.com/?{query}", headers=aws_headers, timeout=(20, 45))
+    auth_data = _jianying_response_json(auth_response, "云端存储授权").get("Result", {}).get("UploadAddress", {})
+    store_infos = auth_data.get("StoreInfos") or []
+    if not store_infos or not auth_data.get("UploadHosts"):
+        raise RuntimeError("字节跳动云存储没有返回上传地址。")
+    store_uri = store_infos[0].get("StoreUri")
+    upload_auth = store_infos[0].get("Auth")
+    upload_id = store_infos[0].get("UploadID")
+    upload_host = auth_data["UploadHosts"][0]
+    if not all((store_uri, upload_auth, upload_id)):
+        raise RuntimeError("云端存储上传参数不完整。")
+    storage_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                     "(KHTML, like Gecko) Chrome/81.0.4044.138 Safari/537.36 Thea/1.0.1",
+                       "Authorization": upload_auth, "Content-CRC32": crc_hex}
+    streamed_upload_headers = dict(storage_headers, **{"Content-Length": str(size)})
+
+    def stream_file(progress_start, progress_span):
+        with open(audio_path, "rb") as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                progress_callback(min(95, progress_start + int(progress_span * source.tell() / max(1, size))),
+                                  "剪映云端：正在上传人声音频…")
+                yield block
+
+    upload_url = f"https://{upload_host}/{store_uri}?partNumber=1&uploadID={upload_id}"
+    progress_callback(55, "剪映云端：上传人声音频…")
+    uploaded = requests.put(upload_url, data=stream_file(55, 18), headers=streamed_upload_headers, timeout=(30, 180))
+    uploaded_json = _jianying_response_json(uploaded, "音频上传")
+    if uploaded_json.get("success") not in (0, "0", None):
+        raise RuntimeError("剪映云端音频上传失败：" + str(uploaded_json.get("message") or uploaded.text[:300]))
+    check_url = f"https://{upload_host}/{store_uri}?uploadID={upload_id}"
+    check = requests.post(check_url, data=f"1:{crc_hex}", headers=storage_headers, timeout=(20, 60))
+    _jianying_response_json(check, "上传校验")
+    # AsrTools 接口流程要求再提交一次分片以完成 commit。
+    commit_url = (f"https://{upload_host}/{store_uri}?uploadID={upload_id}&partNumber=1&"
+                  f"x-amz-security-token={session_token}")
+    committed = requests.put(commit_url, data=stream_file(73, 8), headers=streamed_upload_headers, timeout=(30, 180))
+    committed.raise_for_status()
+
+    song_windows = [{"end_time": int(max(0.0, min(audio_duration, b)) * 1000), "id": "",
+                     "start_time": int(max(0.0, min(audio_duration, a)) * 1000)}
+                    for a, b in singing_segments if b > a]
+    if not song_windows:
+        raise RuntimeError("没有可提交给剪映识别的唱歌区间。")
+    request_id = str(uuid.uuid4())
+    submit_payload = {"adjust_endtime": 200, "audio": store_uri, "caption_type": 2,
+                      "client_request_id": request_id, "max_lines": 1,
+                      "songs_info": song_windows, "words_per_line": 16}
+    progress_callback(82, "剪映云端：提交识别任务…")
+    submit_response = requests.post(
+        "https://lv-pc-api-sinfonlinec.ulikecam.com/lv/v1/audio_subtitle/submit",
+        json=submit_payload, headers=_jianying_headers("/lv/v1/audio_subtitle/submit", tdid), timeout=(20, 60))
+    submit_data = _jianying_response_json(submit_response, "任务提交")
+    task_id = (submit_data.get("data") or {}).get("id")
+    if not task_id:
+        raise RuntimeError("剪映识别接口没有返回任务 ID：" + str(submit_data)[:500])
+
+    query_url = "https://lv-pc-api-sinfonlinec.ulikecam.com/lv/v1/audio_subtitle/query"
+    result = None
+    for attempt in range(30):
+        query_response = requests.post(
+            query_url, json={"id": task_id, "pack_options": {"need_attribute": True}},
+            headers=_jianying_headers("/lv/v1/audio_subtitle/query", tdid), timeout=(20, 60))
+        result = _jianying_response_json(query_response, "识别结果查询")
+        data = result.get("data") or {}
+        utterances = data.get("utterances")
+        status = str(data.get("status") or data.get("task_status") or data.get("state") or "").lower()
+        if isinstance(utterances, list) and (utterances or status in {"success", "succeeded", "done", "completed", "2", "3"} or (not status and attempt >= 2)):
+            break
+        if status in {"failed", "error", "cancelled", "canceled", "-1"}:
+            raise RuntimeError("剪映云端识别任务失败：" + str(data)[:500])
+        progress_callback(min(95, 84 + attempt // 2), "剪映云端：等待识别结果…")
+        time.sleep(2)
+    else:
+        raise RuntimeError("剪映识别超过 60 秒仍未返回结果，请稍后重试。")
+
+    result_data = (result or {}).get("data") or {}
+    utterances = result_data.get("utterances") or []
+    cues = []
+    raw_times = []
+    for utterance in utterances:
+        for key in ("start_time", "end_time", "start", "end"):
+            if utterance.get(key) is not None:
+                try: raw_times.append(float(utterance[key]))
+                except (TypeError, ValueError): pass
+        for word in utterance.get("words") or []:
+            for key in ("start_time", "end_time", "start", "end"):
+                if word.get(key) is not None:
+                    try: raw_times.append(float(word[key]))
+                    except (TypeError, ValueError): pass
+    # 接口版本有的返回秒、有的返回毫秒；用整份结果的最大时间统一判断，避免一句内单位不一致。
+    time_scale = 1000.0 if raw_times and max(raw_times) > max(audio_duration * 1.5, 20.0) else 1.0
+
+    def seconds(value):
+        return float(value or 0) / time_scale
+
+    for utterance in utterances:
+        text = str(utterance.get("text") or "").strip()
+        cleaned = strip_banned_asr(text)
+        if not cleaned:
+            continue
+        start = seconds(utterance.get("start_time", utterance.get("start", 0)))
+        end = seconds(utterance.get("end_time", utterance.get("end", start)))
+        word_items = []
+        for word in utterance.get("words") or []:
+            word_text = str(word.get("text") or "").strip()
+            if not word_text:
+                continue
+            ws = seconds(word.get("start_time", word.get("start", start)))
+            we = seconds(word.get("end_time", word.get("end", ws)))
+            if we > ws:
+                word_items.append((word_text, max(0.0, ws), min(audio_duration, we)))
+        if end <= start and word_items:
+            start = min(item[1] for item in word_items)
+            end = max(item[2] for item in word_items)
+        start = max(0.0, min(audio_duration, start))
+        end = min(audio_duration, end)
+        if end <= start:
+            continue
+        if not word_items:
+            chars = list(_han(cleaned))
+            step = max(0.01, (end - start) / max(1, len(chars)))
+            word_items = [(ch, start + i * step, min(end, start + (i + 1) * step)) for i, ch in enumerate(chars)]
+        cues.append(Cue(start, end, cleaned, 0, word_items))
+    progress_callback(97, "剪映云端识别完成，整理字幕…")
+    return cues
+
+
+def _approx_char_words(text, start, end):
+    chars = list(_han(text))
+    if not chars:
+        return []
+    step = max(0.01, (end - start) / len(chars))
+    return [(ch, start + i * step, min(end, start + (i + 1) * step)) for i, ch in enumerate(chars)]
+
+
+def _timestamp_pairs(raw, offset, duration, assume_milliseconds=False):
+    if isinstance(raw, dict):
+        raw = raw.get("timestamp") or raw.get("timestamps") or raw.get("items") or []
+    if isinstance(raw, np.ndarray):
+        raw = raw.tolist()
+    if not isinstance(raw, (list, tuple)):
+        return []
+    pairs = []
+    for item in raw:
+        try:
+            if isinstance(item, dict):
+                left = item.get("start_time", item.get("start", item.get("begin")))
+                right = item.get("end_time", item.get("end", item.get("finish")))
+            elif isinstance(item, (list, tuple, np.ndarray)) and len(item) >= 2:
+                left, right = item[0], item[1]
+            else:
+                continue
+            if left is None or right is None:
+                continue
+            pairs.append((float(left), float(right)))
+        except (TypeError, ValueError):
+            continue
+    if not pairs:
+        return []
+    largest = max(max(abs(a), abs(b)) for a, b in pairs)
+    scale = 1000.0 if assume_milliseconds or largest > max(duration * 1.5, 20.0) else 1.0
+    out = []
+    for a, b in pairs:
+        a, b = offset + a / scale, offset + b / scale
+        if b > a:
+            out.append((a, b))
+    return out
+
+
+def _qwen_timestamp_pairs(raw, offset, duration):
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raw = raw.get("items") or raw.get("timestamps") or raw.get("timestamp") or []
+    elif hasattr(raw, "items") and not callable(getattr(raw, "items")):
+        raw = raw.items
+    if isinstance(raw, np.ndarray):
+        raw = raw.tolist()
+    if not isinstance(raw, (list, tuple)):
+        return []
+    pairs = []
+    for item in raw:
+        try:
+            if isinstance(item, dict):
+                text = item.get("text", item.get("token", ""))
+                left = item.get("start_time", item.get("start"))
+                right = item.get("end_time", item.get("end"))
+            elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                text, left, right = item[0], item[1], item[2]
+            else:
+                text = getattr(item, "text", getattr(item, "token", ""))
+                left = getattr(item, "start_time", getattr(item, "start", None))
+                right = getattr(item, "end_time", getattr(item, "end", None))
+            if left is None or right is None:
+                continue
+            pairs.append((str(text or ""), float(left), float(right)))
+        except (TypeError, ValueError):
+            continue
+    if not pairs:
+        return []
+    largest = max(max(abs(a), abs(b)) for _text, a, b in pairs)
+    scale = 1000.0 if largest > max(duration * 1.5, 20.0) else 1.0
+    return [(text, offset + a / scale, offset + b / scale) for text, a, b in pairs if b > a]
+
+
+def _cue_from_asr(text, start, end, words=None):
+    cleaned = strip_banned_asr(str(text or "").strip())
+    if not cleaned:
+        return None
+    start, end = float(start), float(end)
+    if end <= start:
+        end = start + 0.1
+    valid_words = []
+    for item in words or []:
+        try:
+            word, ws, we = item
+            word, ws, we = str(word), max(start, float(ws)), min(end, float(we))
+            if word.strip() and we > ws:
+                valid_words.append((word, ws, we))
+        except (TypeError, ValueError):
+            continue
+    if not valid_words:
+        valid_words = _approx_char_words(cleaned, start, end)
+    return Cue(start, end, cleaned, 0, valid_words)
+
+
+def _asr_runtime_choice(engine, model_key):
+    """Use CUDA only when the selected model bundle is likely to fit; never installs drivers/CUDA implicitly."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return "cpu", "int8", torch.float32, 0.0, "CPU"
+        props = torch.cuda.get_device_properties(0)
+        total_gb = props.total_memory / (1024 ** 3)
+        try:
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(0)
+            free_gb = free_bytes / (1024 ** 3)
+        except Exception:
+            free_gb = total_gb
+        if engine == "A":
+            required = 3.5 if model_key == "large-v3-turbo" else 6.0
+        elif engine == "B":
+            required = 1.8
+        elif engine == "C":
+            required = 7.0 if model_key == "0.6B" else 12.0
+        else:
+            required = 0.0
+        if free_gb < required:
+            return "cpu", "int8", torch.float32, total_gb, f"显存不足（可用 {free_gb:.1f} GB），改用 CPU"
+        compute = "float16" if engine == "A" and free_gb >= 6 else "int8_float16" if engine == "A" else "float16"
+        dtype = torch.bfloat16 if getattr(torch.cuda, "is_bf16_supported", lambda: False)() else torch.float16
+        return "cuda", compute, dtype, total_gb, f"CUDA · {props.name} · 可用显存 {free_gb:.1f}/{total_gb:.1f} GB"
+    except Exception as ex:
+        return "cpu", "int8", None, 0.0, f"GPU 探测不可用，回退 CPU（{ex}）"
+
+
+class ModelDownloadWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(s, model_key, parent=None):
+        super().__init__(parent)
+        s.model_key = model_key
+
+    def _download_one(s, url, destination, asset, on_progress):
+        part = destination + ".part"
+        try:
+            with requests.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "identity"},
+                              stream=True, allow_redirects=True, timeout=(20, 120)) as response:
+                response.raise_for_status()
+                content_length = int(response.headers.get("Content-Length") or 0)
+                expected_length = content_length or asset.get("size_hint", 0)
+                received = 0
+                digest = hashlib.sha256()
+                last_percent = -1
+                with open(part, "wb") as output:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        output.write(chunk)
+                        digest.update(chunk)
+                        received += len(chunk)
+                        if expected_length:
+                            percent = min(99, int(received * 100 / expected_length))
+                            if percent != last_percent:
+                                on_progress(percent)
+                                last_percent = percent
+                if content_length and received != content_length:
+                    raise IOError(f"文件未完整传输（收到 {received} / {content_length} 字节）")
+
+            if received < asset.get("min_size", 1):
+                raise IOError("下载结果过小，可能是错误页面或不完整文件")
+            with open(part, "rb") as downloaded:
+                header = downloaded.read(512).lstrip().lower()
+            if header.startswith((b"<!doctype html", b"<html", b"version https://git-lfs.github.com/spec/v1")):
+                raise IOError("下载地址返回了网页或 Git LFS 指针，不是模型文件")
+            expected_hash = asset.get("sha256")
+            expected_prefix = asset.get("sha256_prefix")
+            actual_hash = digest.hexdigest().lower()
+            if expected_hash and actual_hash != expected_hash.lower():
+                raise IOError("模型校验失败（SHA-256 不匹配）")
+            if expected_prefix and not actual_hash.startswith(expected_prefix.lower()):
+                raise IOError("模型校验失败（SHA-256 前缀不匹配）")
+            os.replace(part, destination)
+            on_progress(100)
+        except Exception:
+            try:
+                if os.path.exists(part):
+                    os.remove(part)
+            except OSError:
+                pass
+            raise
+
+    def run(s):
+        try:
+            os.makedirs(APP_MODEL_DIR, exist_ok=True)
+            assets = VOCAL_MODELS[s.model_key]["assets"]
+            total_hint = max(1, sum(max(1, asset.get("size_hint", 1)) for asset in assets))
+            finished_hint = 0
+            for asset in assets:
+                destination = _model_asset_path(s.model_key, asset)
+                size_hint = max(1, asset.get("size_hint", 1))
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                if _model_asset_is_ready(s.model_key, asset):
+                    finished_hint += size_hint
+                    s.progress.emit(min(99, int(finished_hint * 100 / total_hint)))
+                    continue
+
+                errors = []
+                for index, url in enumerate(asset["urls"], 1):
+                    s.status.emit(f"模型 {s.model_key}：正在下载{asset['kind']}（备用连接 {index}/{len(asset['urls'])}）")
+
+                    def report(file_percent, base=finished_hint, weight=size_hint):
+                        overall = int((base + weight * file_percent / 100) * 100 / total_hint)
+                        s.progress.emit(max(0, min(99, overall)))
+
+                    try:
+                        s._download_one(url, destination, asset, report)
+                        break
+                    except Exception as ex:
+                        errors.append(f"连接 {index}：{ex}")
+                else:
+                    if asset.get("required", True):
+                        raise RuntimeError("所有下载连接均失败：\n" + "\n".join(errors))
+                    s.status.emit(f"模型 {s.model_key}：配置文件未下载成功，但原有分离方案仍可使用。")
+
+                finished_hint += size_hint
+                s.progress.emit(min(99, int(finished_hint * 100 / total_hint)))
+
+            if not is_vocal_model_downloaded(s.model_key):
+                raise RuntimeError("模型文件或配置文件未完整下载，请重试。")
+            s.progress.emit(100)
+            s.completed.emit(f"模型 {s.model_key} 已下载并可用。")
+        except Exception as ex:
+            s.failed.emit(str(ex))
+
 ANIM_IN = ["无", "淡入", "上滑入", "下滑入", "左滑入", "右滑入", "放大入", "缩小入", "旋转入", "弹跳入", "翻转入", "打字机"]
 ANIM_OUT = ["无", "淡出", "上滑出", "下滑出", "左滑出", "右滑出", "放大出", "缩小出", "旋转出", "翻转出", "溶解出"]
 ANIM_LOOP = ["无", "呼吸", "上下浮动", "左右摆动", "轻微旋转", "闪烁"]
@@ -450,6 +1444,57 @@ def viterbi(S, order, pen=3.0):
     return out[::-1]
 
 
+def separate_with_roformer(model_key, input_path, output_dir):
+    """用已下载的 RoFormer 权重与同目录 YAML 配置提取人声。"""
+    try:
+        from audio_separator.separator import Separator
+    except ImportError as ex:
+        raise RuntimeError("B/C 模型需要 audio-separator，请先运行 pip install audio-separator") from ex
+
+    model = VOCAL_MODELS[model_key]
+    weight = next(a["filename"] for a in model["assets"] if a["kind"] == "权重")
+    config = next(a["filename"] for a in model["assets"] if a["kind"] == "配置")
+    separator = Separator(output_dir=output_dir, model_file_dir=APP_MODEL_DIR, output_format="WAV")
+
+    # B 是自定义 RoFormer；C 也走本地清单，避免音频分离库再次访问远端模型目录。
+    # 权重和 YAML 已由本程序下载并校验，库只负责按这份配置构造 MDXC 分离器。
+    local_model_index = {
+        "VR": {}, "MDX": {}, "Demucs": {},
+        "MDXC": {
+            f"Local model {model_key}": {
+                "filename": weight,
+                "scores": {},
+                "stems": ["Vocals", "Instrumental"],
+                "target_stem": "Vocals",
+                "download_files": [weight, config],
+            }
+        },
+    }
+    separator.list_supported_model_files = lambda: local_model_index
+    separator.load_model(model_filename=weight)
+    output_files = separator.separate(input_path)
+
+    candidates = []
+    for path in output_files or []:
+        path = os.fspath(path)
+        if not os.path.isabs(path):
+            path = os.path.join(output_dir, path)
+        if os.path.isfile(path):
+            candidates.append(path)
+    if not candidates:
+        candidates = glob.glob(os.path.join(output_dir, "**", "*.wav"), recursive=True)
+
+    vocal = next((p for p in candidates
+                  if "vocal" in os.path.basename(p).lower()
+                  and "instrumental" not in os.path.basename(p).lower()), None)
+    if vocal:
+        return vocal
+    # 兼容部分旧版分离器：未在返回文件名中标注 stem 时，人声轨是第二个输出。
+    if len(candidates) >= 2:
+        return candidates[1]
+    raise RuntimeError("分离模型没有生成可识别的人声 WAV 文件。")
+
+
 class Worker(QThread):
     prog = Signal(int)
     lyr = Signal(str)
@@ -457,19 +1502,182 @@ class Worker(QThread):
     err = Signal(str)
     lab = Signal(list)
     found = Signal(float, float)
+    notice = Signal(str)
 
-    def __init__(s, path, lyrics, rap, order, bpm=0.0, off=0.0, grid=8, pinyin_fix=True):
+    def __init__(s, path, lyrics, rap, order, bpm=0.0, off=0.0, grid=8, pinyin_fix=True,
+                 separator_model="A", asr_engine="A", asr_model="large-v3", cloud_consent=False):
         super().__init__()
         s.path, s.lyrics, s.rap, s.order = path, lyrics, rap, order
         s.bpm, s.off, s.grid, s.pinyin_fix = bpm, off, grid, pinyin_fix
+        s.separator_model = separator_model if separator_model in VOCAL_MODELS else "A"
+        s.asr_engine = asr_engine if asr_engine in ASR_ENGINE_ORDER else "A"
+        s.asr_model = _asr_model_key(s.asr_engine, asr_model)
+        s.cloud_consent = bool(cloud_consent)
+
+    def _load_asr_model(s, engine, model_key, force_cpu=False):
+        device, compute_type, dtype, _vram, detail = _asr_runtime_choice(engine, model_key)
+        if force_cpu:
+            device, compute_type = "cpu", "int8"
+            try:
+                import torch
+                dtype = torch.float32
+            except Exception:
+                dtype = None
+            detail = "CUDA 初始化/推理失败，已回退 CPU。"
+        s.notice.emit(f"ASR 运行设备：{detail}")
+        model_path = resolved_asr_model_path(engine, model_key)
+        if engine == "A":
+            from faster_whisper import WhisperModel
+            return WhisperModel(model_path, device=device, compute_type=compute_type), device
+        if engine == "B":
+            from funasr import AutoModel
+            funasr_device = "cuda:0" if device == "cuda" else "cpu"
+            return AutoModel(model=model_path, device=funasr_device, disable_update=True,
+                             trust_remote_code=False), device
+        if engine == "C":
+            import torch
+            from qwen_asr import Qwen3ASRModel
+            model_dtype = dtype or torch.float32
+            load_kwargs = {"dtype": model_dtype}
+            aligner_device = {"dtype": model_dtype}
+            if device == "cuda":
+                load_kwargs["device_map"] = "cuda:0"
+                aligner_device["device_map"] = "cuda:0"
+            model = Qwen3ASRModel.from_pretrained(
+                model_path, **load_kwargs,
+                max_inference_batch_size=1, max_new_tokens=1024,
+                forced_aligner=_qwen_aligner_path(), forced_aligner_kwargs=aligner_device)
+            return model, device
+        raise RuntimeError(f"不支持的本地 ASR 引擎：{engine}")
+
+    def _load_asr_with_fallback(s, engine, model_key):
+        try:
+            if engine == "A":
+                import faster_whisper  # noqa: F401
+            elif engine == "B":
+                import funasr  # noqa: F401
+            elif engine == "C":
+                import qwen_asr  # noqa: F401
+        except ImportError as ex:
+            package = {"A": "faster-whisper", "B": "funasr modelscope", "C": "qwen-asr"}.get(engine, "")
+            raise RuntimeError(f"识别引擎 {engine} 的运行依赖未安装。请先运行：python -m pip install {package}") from ex
+        try:
+            return s._load_asr_model(engine, model_key, force_cpu=False)
+        except Exception as first_error:
+            try:
+                import torch
+                cuda_available = torch.cuda.is_available()
+            except Exception:
+                cuda_available = False
+            if not cuda_available:
+                if engine == "B" and isinstance(first_error, ImportError):
+                    raise RuntimeError("FunASR 运行库未安装。请先运行：python -m pip install funasr") from first_error
+                if engine == "C" and isinstance(first_error, ImportError):
+                    raise RuntimeError("Qwen3-ASR 运行库未安装。请先运行：python -m pip install -U qwen-asr") from first_error
+                raise
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                s.notice.emit(f"GPU 初始化失败，正在改用 CPU：{first_error}")
+                return s._load_asr_model(engine, model_key, force_cpu=True)
+            except Exception as cpu_error:
+                raise RuntimeError(f"GPU 和 CPU 均无法加载识别模型。GPU 错误：{first_error}\nCPU 错误：{cpu_error}") from cpu_error
+
+    def _transcribe_local_segment(s, engine, model, chunk, a, b, prompt):
+        if len(chunk) == 0:
+            return []
+        if engine == "A":
+            segments, _info = model.transcribe(
+                chunk, word_timestamps=True, initial_prompt=prompt,
+                condition_on_previous_text=False, beam_size=5)
+            cues = []
+            for segment in segments:
+                words = [(word.word, a + float(word.start), a + float(word.end))
+                         for word in (segment.words or []) if float(word.end) > float(word.start)]
+                cue = _cue_from_asr(segment.text, a + float(segment.start), a + float(segment.end), words)
+                if cue:
+                    cues.append(cue)
+            return cues
+        if engine == "B":
+            hotword = " ".join(dict.fromkeys(x.strip() for x in clean_lyrics(prompt or "").splitlines() if x.strip()))[:300] or None
+            try:
+                result = model.generate(input=np.asarray(chunk, dtype=np.float32), batch_size_s=300,
+                                        hotword=hotword, sentence_timestamp=True)
+            except TypeError:
+                result = model.generate(input=np.asarray(chunk, dtype=np.float32), batch_size_s=300,
+                                        hotword=hotword)
+            cues = []
+            for item in result or []:
+                text = str(item.get("text") or "").strip()
+                timestamp = item.get("timestamp") or item.get("timestamps")
+                pairs = _timestamp_pairs(timestamp, a, b - a, assume_milliseconds=True)
+                sentence_info = item.get("sentence_info") or []
+                if sentence_info:
+                    cursor = 0
+                    sentence_cues = []
+                    for sentence in sentence_info:
+                        sentence_text = str(sentence.get("text") or sentence.get("sentence") or "").strip()
+                        sentence_chars = list(_han(sentence_text))
+                        sentence_pairs = _timestamp_pairs(sentence.get("timestamp") or sentence.get("timestamps"),
+                                                           a, b - a, assume_milliseconds=True)
+                        if not sentence_pairs and sentence_chars and cursor < len(pairs):
+                            sentence_pairs = pairs[cursor:cursor + len(sentence_chars)]
+                        cursor += len(sentence_chars)
+                        range_pairs = _timestamp_pairs([[sentence.get("start", 0), sentence.get("end", 0)]],
+                                                       a, b - a, assume_milliseconds=True)
+                        sentence_start = range_pairs[0][0] if range_pairs else (sentence_pairs[0][0] if sentence_pairs else a)
+                        sentence_end = range_pairs[0][1] if range_pairs else (sentence_pairs[-1][1] if sentence_pairs else b)
+                        sentence_words = [(ch, pair[0], pair[1]) for ch, pair in zip(sentence_chars, sentence_pairs)]
+                        cue = _cue_from_asr(sentence_text, sentence_start, sentence_end, sentence_words)
+                        if cue:
+                            sentence_cues.append(cue)
+                    if sentence_cues:
+                        cues.extend(sentence_cues)
+                        continue
+                chars = [ch for ch in text if not ch.isspace()]
+                han_chars = list(_han(text))
+                if pairs and len(pairs) == len(chars):
+                    words = [(ch, pair[0], pair[1]) for ch, pair in zip(chars, pairs)]
+                elif pairs and len(pairs) == len(han_chars):
+                    words = [(ch, pair[0], pair[1]) for ch, pair in zip(han_chars, pairs)]
+                elif pairs and han_chars:
+                    words = []
+                    for i, ch in enumerate(han_chars):
+                        pair = pairs[min(len(pairs) - 1, int(i * len(pairs) / len(han_chars)))]
+                        words.append((ch, pair[0], pair[1]))
+                else:
+                    words = []
+                cue = _cue_from_asr(text, a, b, words)
+                if cue:
+                    cues.append(cue)
+            return cues
+        if engine == "C":
+            results = model.transcribe(audio=(np.asarray(chunk, dtype=np.float32), 16000),
+                                       context=(prompt or "")[:600], language=None,
+                                       return_time_stamps=True)
+            cues = []
+            for result in results or []:
+                text = str(getattr(result, "text", "") or "").strip()
+                aligned = _qwen_timestamp_pairs(getattr(result, "time_stamps", None), a, b - a)
+                words = [(token, ws, we) for token, ws, we in aligned]
+                cue = _cue_from_asr(text, a, b, words)
+                if cue:
+                    cues.append(cue)
+            return cues
+        raise RuntimeError(f"不支持的本地 ASR 引擎：{engine}")
 
     def run(s):
         try:
             s.done.emit(s.work())
-        except Exception as ex:
+        except BaseException as ex:
+            # audio-separator 某些版本会用 sys.exit() 报错；在线程里也要转成界面错误提示。
             s.err.emit(repr(ex))
 
     def work(s):
+        if not is_vocal_model_downloaded(s.separator_model):
+            raise RuntimeError(f"人声分离模型 {s.separator_model} 尚未下载完整，请先到右侧‘设置’下载。")
         import soundfile as sf, torch, torchaudio
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         # 0) 自动下载歌词
@@ -481,11 +1689,17 @@ class Worker(QThread):
             except Exception:
                 pass
         s.prog.emit(3)
-        # 1) 人声分离 (demucs)
+        # 1) 人声分离：A 保留原有 Demucs 流程，B/C 使用本地 RoFormer 权重与配置。
         tmp = tempfile.mkdtemp()
-        subprocess.run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", tmp, s.path],
-                       check=True, capture_output=True)
-        voc = glob.glob(os.path.join(tmp, "**", "vocals.wav"), recursive=True)[0]
+        if s.separator_model == "A":
+            subprocess.run([sys.executable, "-m", "demucs", "--two-stems=vocals", "-o", tmp, s.path],
+                           check=True, capture_output=True)
+            vocal_paths = glob.glob(os.path.join(tmp, "**", "vocals.wav"), recursive=True)
+            if not vocal_paths:
+                raise RuntimeError("A 模型没有生成 vocals.wav，请检查 Demucs 安装或模型文件。")
+            voc = vocal_paths[0]
+        else:
+            voc = separate_with_roformer(s.separator_model, s.path, tmp)
         y, sr = sf.read(voc, always_2d=True)
         y = torch.from_numpy(y.mean(1).astype(np.float32))
         y16 = torchaudio.functional.resample(y, sr, 16000).numpy()
@@ -559,21 +1773,38 @@ class Worker(QThread):
         for a_i, b_i in merged:
             segs.append([max(0, cells[a_i][0] - 0.3), min(total, cells[b_i][1] + 0.3)])
         s.prog.emit(50)
-        # 3) 字级ASR: faster-whisper large-v3, 歌词注入 initial_prompt
-        from faster_whisper import WhisperModel
-        model = WhisperModel("large-v3", device=dev, compute_type="float16" if dev == "cuda" else "int8")
-        prompt = " ".join(dict.fromkeys(clean_lyrics(s.lyrics).split("\n")))[:400] or None
+        # 3) 字级 ASR：A Faster-Whisper，B FunASR，C Qwen3-ASR，D 剪映云端接口。
+        engine = s.asr_engine
+        model_key = _asr_model_key(engine, s.asr_model)
+        if engine != "D" and not is_asr_model_downloaded(engine, model_key):
+            raise RuntimeError(f"识别模型 {engine}/{model_key} 未下载完整，请先到设置区下载。")
+        prompt = " ".join(dict.fromkeys(clean_lyrics(s.lyrics).split("\n")))[:600] or None
         cues = []
-        for n, (a, b) in enumerate(segs):
-            chunk = y16[int(a * 16000):int(b * 16000)]
-            res, _ = model.transcribe(chunk, word_timestamps=True, initial_prompt=prompt,
-                                      condition_on_previous_text=False, beam_size=5)
-            for sg in res:
-                ws = [(w.word, a + w.start, a + w.end) for w in (sg.words or [])]
-                cleaned = strip_banned_asr(sg.text.strip())
-                if cleaned:
-                    cues.append(Cue(a + sg.start, a + sg.end, cleaned, 0, ws))
-            s.prog.emit(50 + int(50 * (n + 1) / len(segs)))
+        if engine == "D":
+            if not s.cloud_consent:
+                raise RuntimeError("使用剪映云端识别前必须确认音频上传告知。")
+            cues = run_jianying_asr(voc, segs, total,
+                                    progress_callback=lambda value, text: (s.prog.emit(value), s.notice.emit(text)))
+        else:
+            model, runtime_device = s._load_asr_with_fallback(engine, model_key)
+            for n, (a, b) in enumerate(segs):
+                chunk = np.asarray(y16[int(a * 16000):int(b * 16000)], dtype=np.float32)
+                try:
+                    new_cues = s._transcribe_local_segment(engine, model, chunk, a, b, prompt)
+                except Exception as ex:
+                    if runtime_device != "cuda":
+                        raise
+                    try:
+                        import torch
+                        del model
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    s.notice.emit(f"GPU 推理失败，切换 CPU 重试当前片段：{ex}")
+                    model, runtime_device = s._load_asr_model(engine, model_key, force_cpu=True)
+                    new_cues = s._transcribe_local_segment(engine, model, chunk, a, b, prompt)
+                cues.extend(new_cues)
+                s.prog.emit(50 + int(47 * (n + 1) / max(1, len(segs))))
         s.fixed_count=0
         if s.pinyin_fix and s.lyrics.strip():
             cues, s.fixed_count = correct_cues_by_pinyin(cues, s.lyrics)
@@ -600,19 +1831,25 @@ class BatchWorker(QThread):
     prog = Signal(int)
     done = Signal(list)
 
-    def __init__(s, files, outdir, st, rap, order):
+    def __init__(s, files, outdir, st, rap, order, separator_model="A", asr_engine="A",
+                 asr_model="large-v3", cloud_consent=False):
         super().__init__(); s.files, s.outdir, s.st, s.rap, s.order = files, outdir, st, rap, order
+        s.separator_model = separator_model if separator_model in VOCAL_MODELS else "A"
+        s.asr_engine = asr_engine if asr_engine in ASR_ENGINE_ORDER else "A"
+        s.asr_model = _asr_model_key(s.asr_engine, asr_model)
+        s.cloud_consent = bool(cloud_consent)
 
     def run(s):
         bad, n = [], len(s.files)
         for i, f in enumerate(s.files):
             try:
-                w = Worker(f, "", s.rap, s.order, pinyin_fix=True)
+                w = Worker(f, "", s.rap, s.order, pinyin_fix=True, separator_model=s.separator_model,
+                           asr_engine=s.asr_engine, asr_model=s.asr_model, cloud_consent=s.cloud_consent)
                 w.prog.connect(lambda v, i=i: s.prog.emit(int((i + v / 100 * 0.7) / n * 100)))
                 cues = w.work()
                 out = os.path.join(s.outdir, os.path.splitext(os.path.basename(f))[0] + ".mp4")
                 render_mp4(f, cues, s.st, out, prog=lambda v, i=i: s.prog.emit(int((i + 0.7 + v / 100 * 0.3) / n * 100)))
-            except Exception as ex:
+            except BaseException as ex:
                 bad.append(os.path.basename(f) + ": " + repr(ex))
         s.prog.emit(100); s.done.emit(bad)
 
@@ -769,6 +2006,20 @@ class Main(QMainWindow):
         super().__init__()
         s.setWindowTitle("字幕工作室"); s.resize(1500, 900)
         s.st, s.cues, s.t, s.dur, s.env, s.cur, s.blk, s.path, s.worker = dict(STYLE), [], 0.0, 60.0, None, None, False, "", None
+        if s.st.get("vocal_model") not in VOCAL_MODELS:
+            s.st["vocal_model"] = "A"
+        if not isinstance(s.st.get("asr_models"), dict):
+            s.st["asr_models"] = dict(ASR_DEFAULT_MODELS)
+        for _engine in ASR_ENGINE_ORDER:
+            s.st["asr_models"][_engine] = _asr_model_key(_engine, s.st["asr_models"].get(_engine))
+        if s.st.get("asr_engine") not in ASR_ENGINE_ORDER:
+            s.st["asr_engine"] = "A"
+        s.model_download_worker = None; s.model_download_key = None; s.model_download_busy = False
+        s.asr_download_worker = None; s.asr_download_key = None; s.asr_download_busy = False
+        s.gpu_worker = None; s.gpu_info = {"cuda": False, "name": "", "vram_gb": 0.0}
+        s.asr_running = False; s.batch_running = False
+        s.model_select_buttons = {}; s.model_status_labels = {}; s.model_download_buttons = {}
+        s.asr_engine_buttons = {}; s.asr_model_combos = {}; s.asr_model_status_labels = {}; s.asr_model_download_buttons = {}
         s.tracks = [["导入字幕", "sub"], ["导入视频", "video"], ["导入音频", "audio"]]
         s.video_path = ""
         s.cells = []
@@ -803,7 +2054,7 @@ class Main(QMainWindow):
         L.addStretch(1)
         def panel_scroll(widget):
             sc=QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame); sc.setMinimumSize(0,0); sc.setWidget(widget); return sc
-        s.tabs = QTabWidget(); s.tabs.addTab(s.general_settings(), "设置"); s.tabs.addTab(panel_scroll(s.settings()), "歌词样式"); s.tabs.addTab(panel_scroll(s.title_settings()), "歌名设置"); s.tabs.addTab(s.animation_settings(), "动画")
+        s.tabs = QTabWidget(); s.tabs.addTab(panel_scroll(s.general_settings()), "设置"); s.tabs.addTab(panel_scroll(s.settings()), "歌词样式"); s.tabs.addTab(panel_scroll(s.title_settings()), "歌名设置"); s.tabs.addTab(s.animation_settings(), "动画")
 
         # ---- 中: 预览 + 播放控制 ----
         mid = QWidget(); M = QVBoxLayout(mid); M.setContentsMargins(4,4,4,4); M.setSpacing(4); M.addWidget(s.preview, 1)
@@ -818,7 +2069,7 @@ class Main(QMainWindow):
         bi=QPushButton("…"); bi.setToolTip("选择批量输入文件夹"); bi.setFixedWidth(26); bi.clicked.connect(s.pick_batch_input)
         s.batch_out=QLineEdit(); s.batch_out.setPlaceholderText("输出文件夹"); s.batch_out.setToolTip("批量生成的输出文件夹"); s.batch_out.setMaximumWidth(145)
         bo=QPushButton("…"); bo.setToolTip("选择批量输出文件夹"); bo.setFixedWidth(26); bo.clicked.connect(s.pick_batch_output)
-        bat=QPushButton("批量生成"); bat.clicked.connect(s.batch)
+        s.btn_batch=QPushButton("批量生成"); s.btn_batch.clicked.connect(s.batch); bat=s.btn_batch
         srt=QPushButton("导出SRT"); srt.clicked.connect(s.export_srt)
         exp=QPushButton("导出MP4"); exp.clicked.connect(s.export_mp4)
         actions.addWidget(s.play); actions.addWidget(s.demo_btn); actions.addStretch(1); actions.addWidget(QLabel("输入")); actions.addWidget(s.batch_in); actions.addWidget(bi); actions.addWidget(QLabel("输出")); actions.addWidget(s.batch_out); actions.addWidget(bo); actions.addWidget(bat); actions.addWidget(srt); actions.addWidget(exp)
@@ -838,6 +2089,8 @@ class Main(QMainWindow):
         main = QSplitter(Qt.Vertical); main.addWidget(top); main.addWidget(bot); main.setStretchFactor(0, 1); main.setStretchFactor(1, 0); main.setSizes([560, 390])
         s.setCentralWidget(main)
         s.apply_theme(s.st.get("theme","专业深色"))
+        s.refresh_vocal_model_controls(); s.refresh_asr_controls()
+        QTimer.singleShot(0, s.start_gpu_detection)
 
     def resizeEvent(s, e):
         super().resizeEvent(e)
@@ -848,6 +2101,88 @@ class Main(QMainWindow):
     # ---- 右: 通用设置、字幕设置 + 动画 ----
     def general_settings(s):
         w=QWidget(); v=QVBoxLayout(w); v.setContentsMargins(8,8,8,8); v.setSpacing(8)
+        model_box=QGroupBox("人声分离模型")
+        model_layout=QVBoxLayout(model_box); model_layout.setContentsMargins(8,12,8,8); model_layout.setSpacing(6)
+        s.model_button_group=QButtonGroup(w); s.model_button_group.setExclusive(True)
+        for key in ("A", "B", "C"):
+            info=VOCAL_MODELS[key]
+            row=QWidget(); row_layout=QHBoxLayout(row); row_layout.setContentsMargins(0,0,0,0); row_layout.setSpacing(6)
+            select=QPushButton(key); select.setCheckable(True); select.setFixedSize(42,36)
+            select.setToolTip(info["description"])
+            select.setStyleSheet(
+                f"QPushButton{{background:{info['color']};color:white;border:1px solid #8290aa;border-radius:8px;font-size:16px;font-weight:bold;}}"
+                "QPushButton:checked{border:3px solid white;}"
+                "QPushButton:hover{border:2px solid #dbe4ff;}"
+            )
+            s.model_button_group.addButton(select); s.model_select_buttons[key]=select
+            select.toggled.connect(lambda checked, model_key=key: s.set_vocal_model(model_key) if checked else None)
+            description=QLabel(info["description"]); description.setWordWrap(True); description.setStyleSheet("color:#cbd2e3;")
+            status=QLabel("未下载"); status.setAlignment(Qt.AlignCenter); status.setMinimumWidth(48)
+            download=QPushButton("下载"); download.setFixedWidth(62)
+            download.clicked.connect(lambda _=False, model_key=key: s.start_model_download(model_key))
+            s.model_status_labels[key]=status; s.model_download_buttons[key]=download
+            row_layout.addWidget(select); row_layout.addWidget(description,1); row_layout.addWidget(status); row_layout.addWidget(download)
+            model_layout.addWidget(row)
+        s.model_download_note=QLabel("首次使用前，请至少下载一个模型；B/C 需要额外安装 audio-separator。")
+        s.model_download_note.setWordWrap(True); s.model_download_note.setStyleSheet("color:#aeb8cc;padding-top:3px;")
+        s.model_download_progress=QProgressBar(); s.model_download_progress.setRange(0,100); s.model_download_progress.setValue(0); s.model_download_progress.setFormat("下载进度 %p%")
+        s.model_download_progress.hide(); model_layout.addWidget(s.model_download_note); model_layout.addWidget(s.model_download_progress)
+        selected=s.st.get("vocal_model","A") if s.st.get("vocal_model","A") in VOCAL_MODELS else "A"
+        previous=s.model_select_buttons[selected].blockSignals(True); s.model_select_buttons[selected].setChecked(True); s.model_select_buttons[selected].blockSignals(previous)
+        s.st["vocal_model"]=selected
+        v.addWidget(model_box)
+
+        # 独立 ASR 引擎区：每行显示引擎字母、特点、模型选择、状态与下载入口。
+        asr_box=QGroupBox("语音识别引擎（ASR）")
+        asr_layout=QVBoxLayout(asr_box); asr_layout.setContentsMargins(8,12,8,8); asr_layout.setSpacing(5)
+        s.asr_engine_group=QButtonGroup(w); s.asr_engine_group.setExclusive(True)
+        for engine in ASR_ENGINE_ORDER:
+            row=QWidget(); row_layout=QVBoxLayout(row); row_layout.setContentsMargins(0,0,0,0); row_layout.setSpacing(2)
+            controls=QHBoxLayout(); controls.setContentsMargins(0,0,0,0); controls.setSpacing(5)
+            info=ASR_ENGINE_DESCRIPTIONS[engine]
+            choose=QPushButton(engine); choose.setCheckable(True); choose.setFixedSize(34,32)
+            choose.setToolTip(info)
+            palette={"A":"#19A974","B":"#8B5CF6","C":"#168BCE","D":"#E08A32"}
+            choose.setStyleSheet(f"QPushButton{{background:{palette[engine]};color:white;border:1px solid #8290aa;border-radius:7px;font-weight:bold;}} QPushButton:checked{{border:3px solid white;}}")
+            s.asr_engine_group.addButton(choose)
+            s.asr_engine_buttons[engine]=choose
+            choose.toggled.connect(lambda checked, key=engine: s.set_asr_engine(key) if checked else None)
+            description=QLabel(info); description.setWordWrap(True); description.setStyleSheet("color:#cbd2e3;font-size:11px;")
+            combo=QComboBox(); combo.setMinimumWidth(130); combo.setMaximumWidth(190)
+            for model_key,label in ASR_MODEL_CHOICES[engine]:
+                combo.addItem(label,model_key)
+            selected_model=_asr_model_key(engine,s.st["asr_models"].get(engine))
+            combo.setCurrentIndex(max(0,combo.findData(selected_model)))
+            combo.setEnabled(engine!="D")
+            combo.currentIndexChanged.connect(lambda index,key=engine,box=combo: s.set_asr_model(key,box.itemData(index)) if index>=0 else None)
+            status=QLabel("云端" if engine=="D" else "未下载"); status.setAlignment(Qt.AlignCenter); status.setMinimumWidth(50)
+            download=QPushButton("无下载" if engine=="D" else "下载"); download.setFixedWidth(58)
+            if engine=="D":
+                download.setEnabled(False)
+                download.setToolTip("剪映接口由云端提供识别，不存在可下载到本机的模型权重。")
+            else:
+                download.clicked.connect(lambda _=False,key=engine: s.start_asr_model_download(key))
+            s.asr_model_combos[engine]=combo; s.asr_model_status_labels[engine]=status; s.asr_model_download_buttons[engine]=download
+            controls.addWidget(choose); controls.addWidget(combo,1); controls.addWidget(status); controls.addWidget(download)
+            row_layout.addLayout(controls); row_layout.addWidget(description)
+            asr_layout.addWidget(row)
+
+        gpu_row=QHBoxLayout()
+        s.gpu_info_label=QLabel("GPU 检测中…"); s.gpu_info_label.setWordWrap(True); s.gpu_info_label.setStyleSheet("color:#aeb8cc;font-size:11px;")
+        s.gpu_detect_button=QPushButton("重检 GPU"); s.gpu_detect_button.setFixedWidth(74); s.gpu_detect_button.clicked.connect(s.start_gpu_detection)
+        gpu_row.addWidget(s.gpu_info_label,1); gpu_row.addWidget(s.gpu_detect_button); asr_layout.addLayout(gpu_row)
+        s.asr_download_note=QLabel("首次使用需至少下载一个 A/B/C 本地识别模型，并下载当前所选模型。B 需 pip install funasr modelscope；C 需 pip install -U qwen-asr。不会自动更换 PyTorch/CUDA。")
+        s.asr_download_note.setWordWrap(True); s.asr_download_note.setStyleSheet("color:#aeb8cc;font-size:11px;padding-top:2px;")
+        asr_layout.addWidget(s.asr_download_note)
+        s.asr_download_progress=QProgressBar(); s.asr_download_progress.setRange(0,100); s.asr_download_progress.setValue(0)
+        s.asr_download_progress.setFormat("识别模型下载 %p%"); s.asr_download_progress.hide(); asr_layout.addWidget(s.asr_download_progress)
+        saved_engine=s.st.get("asr_engine","A") if s.st.get("asr_engine","A") in ASR_ENGINE_ORDER else "A"
+        old_block=s.asr_engine_buttons[saved_engine].blockSignals(True)
+        s.asr_engine_buttons[saved_engine].setChecked(True)
+        s.asr_engine_buttons[saved_engine].blockSignals(old_block)
+        s.st["asr_engine"]=saved_engine
+        v.addWidget(asr_box)
+
         skin=QGroupBox("界面皮肤"); sf=QFormLayout(skin); s.theme_combo=QComboBox(); s.theme_combo.addItems(list(THEMES)); s.theme_combo.setCurrentText(s.st.get("theme","专业深色")); s.theme_combo.currentTextChanged.connect(s.apply_theme); sf.addRow("皮肤",s.theme_combo)
         adv=QGroupBox("高级识别设置（一般保持默认即可）"); af=QFormLayout(adv)
         s.rap=QCheckBox("说唱也识别（实验功能，默认关闭）"); af.addRow("识别范围",s.rap)
@@ -954,6 +2289,284 @@ class Main(QMainWindow):
             c = QColorDialog.getColor(QColor(target[key]), s)
             if c.isValid(): target[key]=c.name(); s.preview.update(); paint()
         b.clicked.connect(pick); paint(); return b
+
+    def save_settings(s):
+        try:
+            with open(STYLE_FILE, "w", encoding="utf-8") as config:
+                json.dump(s.st, config, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def set_asr_engine(s, engine):
+        if engine not in ASR_ENGINE_ORDER:
+            return
+        s.st["asr_engine"] = engine
+        s.save_settings()
+        s.refresh_asr_controls()
+
+    def set_asr_model(s, engine, model_key):
+        if engine not in ASR_ENGINE_ORDER:
+            return
+        if not isinstance(s.st.get("asr_models"), dict):
+            s.st["asr_models"] = dict(ASR_DEFAULT_MODELS)
+        s.st["asr_models"][engine] = _asr_model_key(engine, model_key)
+        s.save_settings()
+        s.refresh_asr_controls()
+
+    def selected_asr_model(s, engine=None):
+        engine = engine or s.st.get("asr_engine", "A")
+        return _asr_model_key(engine, s.st.get("asr_models", {}).get(engine))
+
+    def refresh_asr_controls(s):
+        if not hasattr(s, "asr_model_status_labels"):
+            return
+        selected_engine = s.st.get("asr_engine", "A")
+        for engine in ASR_ENGINE_ORDER:
+            selector = s.asr_engine_buttons.get(engine)
+            if selector and selector.isChecked() != (engine == selected_engine):
+                old = selector.blockSignals(True); selector.setChecked(engine == selected_engine); selector.blockSignals(old)
+            combo = s.asr_model_combos.get(engine)
+            if combo and engine != "D":
+                chosen = s.selected_asr_model(engine)
+                if combo.currentData() != chosen:
+                    old = combo.blockSignals(True); combo.setCurrentIndex(max(0, combo.findData(chosen))); combo.blockSignals(old)
+            status = s.asr_model_status_labels.get(engine)
+            button = s.asr_model_download_buttons.get(engine)
+            if engine == "D":
+                if status:
+                    status.setText("云端")
+                    status.setStyleSheet("color:#e0a14b;font-weight:bold;")
+                continue
+            model_key = s.selected_asr_model(engine)
+            ready = is_asr_model_downloaded(engine, model_key)
+            downloading = s.asr_download_busy and s.asr_download_key == (engine, model_key)
+            if status:
+                status.setText("已下载" if ready else "下载中" if downloading else "未下载")
+                status.setStyleSheet("color:#58d68d;font-weight:bold;" if ready else "color:#f0bd62;" if downloading else "color:#aeb8cc;")
+            if button:
+                button.setText("已下载" if ready else "下载中" if downloading else "下载")
+                button.setEnabled(not ready and not s.asr_download_busy)
+        if hasattr(s, "asr_engine_buttons"):
+            for engine, selector in s.asr_engine_buttons.items():
+                if selector.isChecked() != (engine == selected_engine):
+                    old = selector.blockSignals(True); selector.setChecked(engine == selected_engine); selector.blockSignals(old)
+        if hasattr(s, "asr_download_note") and not s.asr_download_busy:
+            if selected_engine == "D":
+                s.asr_download_note.setText("D 不下載本地權重；使用前需先下載任意一個 A/B/C 本地識別模型。剪映會上傳人聲至第三方雲端，使用時會再次要求確認。")
+            else:
+                current_key = s.selected_asr_model(selected_engine)
+                if is_asr_model_downloaded(selected_engine, current_key):
+                    s.asr_download_note.setText(f"已就緒：{selected_engine}/{current_key}。其他模型可按需下載；首次使用至少需要一個本地 ASR 模型。")
+                else:
+                    s.asr_download_note.setText(f"請下載當前模型 {selected_engine}/{current_key}。下載會依序嘗試 ModelScope、Hugging Face 和鏡像並顯示百分比。")
+        s.update_run_buttons()
+
+    def start_gpu_detection(s):
+        if s.gpu_worker is not None and s.gpu_worker.isRunning():
+            return
+        if not hasattr(s, "gpu_info_label"):
+            return
+        s.gpu_info_label.setText("正在檢測 GPU / CUDA…")
+        if hasattr(s, "gpu_detect_button"):
+            s.gpu_detect_button.setEnabled(False)
+        worker = GPUDetectWorker(s)
+        s.gpu_worker = worker
+        worker.detected.connect(s.gpu_detection_completed)
+        worker.finished.connect(s.gpu_detection_thread_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def gpu_detection_completed(s, detail, info):
+        s.gpu_info = info if isinstance(info, dict) else {}
+        s.gpu_info_label.setText("GPU：" + str(detail))
+        s.gpu_info_label.setToolTip("執行時會依所選引擎、可用顯存自動選 CUDA/CPU 和精度；不會自動安裝/覆蓋顯卡驅動。")
+
+    def gpu_detection_thread_finished(s):
+        s.gpu_worker = None
+        if hasattr(s, "gpu_detect_button"):
+            s.gpu_detect_button.setEnabled(True)
+
+    def start_asr_model_download(s, engine):
+        if engine not in ASR_MODEL_SPECS:
+            return
+        if s.asr_download_worker is not None and s.asr_download_worker.isRunning():
+            return
+        model_key = s.selected_asr_model(engine)
+        if is_asr_model_downloaded(engine, model_key):
+            s.refresh_asr_controls()
+            return
+        if engine == "C" and model_key == "1.7B":
+            reply = QMessageBox.question(s, "大型模型下載確認",
+                                         "Qwen3-ASR-1.7B 及逐字對齊模型合計需要數 GB 磁碟空間，下載時間較長。仍要繼續嗎？",
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        selector = s.asr_engine_buttons.get(engine)
+        if selector:
+            selector.setChecked(True)
+        s.st["asr_engine"] = engine
+        s.asr_download_key = (engine, model_key)
+        s.asr_download_busy = True
+        s.asr_download_progress.setValue(0); s.asr_download_progress.show()
+        s.asr_download_note.setText(f"正在準備下載識別模型 {engine}/{model_key}…")
+        s.save_settings(); s.refresh_asr_controls(); s.refresh_vocal_model_controls()
+        worker = ASRModelDownloadWorker(engine, model_key, s)
+        s.asr_download_worker = worker
+        worker.progress.connect(s.asr_download_progress.setValue)
+        worker.status.connect(s.asr_download_note.setText)
+        worker.completed.connect(s.asr_model_download_succeeded)
+        worker.failed.connect(s.asr_model_download_failed)
+        worker.finished.connect(s.asr_model_download_thread_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def asr_model_download_succeeded(s, message):
+        s.asr_download_busy = False; s.asr_download_key = None
+        s.asr_download_progress.setValue(100); s.asr_download_progress.show()
+        s.asr_download_note.setText(message)
+        s.refresh_asr_controls(); s.refresh_vocal_model_controls()
+        s.statusBar().showMessage(message, 8000)
+
+    def asr_model_download_failed(s, message):
+        key = s.asr_download_key or (s.st.get("asr_engine", "A"), s.selected_asr_model())
+        s.asr_download_busy = False; s.asr_download_key = None
+        s.asr_download_progress.setValue(0); s.asr_download_progress.show()
+        s.asr_download_note.setText(f"模型 {key[0]}/{key[1]} 下载失败，可重试。")
+        s.refresh_asr_controls(); s.refresh_vocal_model_controls()
+        QMessageBox.warning(s, "识别模型下载失败", message)
+
+    def asr_model_download_thread_finished(s):
+        s.asr_download_worker = None
+        s.refresh_asr_controls(); s.refresh_vocal_model_controls()
+
+    def check_selected_asr_model(s):
+        if s.asr_download_busy:
+            QMessageBox.information(s, "请稍候", "识别模型下载完成后再开始处理。")
+            return False
+        if not any_local_asr_model_downloaded():
+            s.tabs.setCurrentIndex(0)
+            QMessageBox.information(s, "需要下载模型", "首次使用前，请在设置区至少下载一个 A/B/C 本地识别模型。D 是云端接口，不含可下载权重，不能替代本地模型下载要求。")
+            return False
+        engine = s.st.get("asr_engine", "A")
+        if engine == "D":
+            return True
+        model_key = s.selected_asr_model(engine)
+        if not is_asr_model_downloaded(engine, model_key):
+            s.tabs.setCurrentIndex(0)
+            QMessageBox.information(s, "所选识别模型尚未下载", f"当前选择的是 {engine}/{model_key}，请先点击它旁边的‘下载’并等待完成。")
+            return False
+        return True
+
+    def update_run_buttons(s):
+        if not hasattr(s, "btn_asr"):
+            return
+        vocal_key = s.st.get("vocal_model", "A")
+        vocal_ready = is_vocal_model_downloaded(vocal_key)
+        engine = s.st.get("asr_engine", "A")
+        local_ready = any_local_asr_model_downloaded()
+        asr_ready = local_ready if engine == "D" else is_asr_model_downloaded(engine, s.selected_asr_model(engine))
+        busy = s.model_download_busy or s.asr_download_busy or s.asr_running or s.batch_running
+        can_run = vocal_ready and asr_ready and not busy
+        if engine == "D" and not local_ready:
+            reason = "D 为云端接口；按首次使用规则，需先下载至少一个 A/B/C 本地 ASR 模型。"
+        elif not vocal_ready:
+            reason = f"请先下载所选人声分离模型 {vocal_key}。"
+        elif not asr_ready:
+            reason = f"请先下载当前识别引擎所选模型 {engine}/{s.selected_asr_model(engine)}。"
+        elif busy:
+            reason = "模型下载或识别正在进行，请稍候。"
+        else:
+            reason = "使用当前选择的人声分离模型与 ASR 引擎生成字幕。"
+        s.btn_asr.setEnabled(can_run); s.btn_asr.setToolTip(reason)
+        if hasattr(s, "btn_batch"):
+            s.btn_batch.setEnabled(can_run); s.btn_batch.setToolTip(reason)
+
+    def set_vocal_model(s, model_key):
+        if model_key not in VOCAL_MODELS:
+            return
+        s.st["vocal_model"] = model_key
+        s.save_settings()
+        s.refresh_vocal_model_controls()
+
+    def refresh_vocal_model_controls(s):
+        if not hasattr(s, "model_download_buttons"):
+            return
+        selected = s.st.get("vocal_model", "A")
+        for key in ("A", "B", "C"):
+            ready = is_vocal_model_downloaded(key)
+            downloading = s.model_download_busy and s.model_download_key == key
+            status = s.model_status_labels.get(key)
+            button = s.model_download_buttons.get(key)
+            selector = s.model_select_buttons.get(key)
+            if status:
+                status.setText("已下载" if ready else "下载中" if downloading else "未下载")
+                status.setStyleSheet("color:#58d68d;font-weight:bold;" if ready else "color:#f0bd62;" if downloading else "color:#aeb8cc;")
+            if button:
+                button.setText("已下载" if ready else "下载中" if downloading else "下载")
+                button.setEnabled(not ready and not s.model_download_busy)
+            if selector and selector.isChecked() != (key == selected):
+                was_blocked = selector.blockSignals(True)
+                selector.setChecked(key == selected)
+                selector.blockSignals(was_blocked)
+        s.update_run_buttons()
+
+    def start_model_download(s, model_key):
+        if model_key not in VOCAL_MODELS:
+            return
+        if s.model_download_worker is not None and s.model_download_worker.isRunning():
+            return
+        if is_vocal_model_downloaded(model_key):
+            s.refresh_vocal_model_controls()
+            return
+        s.model_select_buttons[model_key].setChecked(True)
+        s.model_download_key = model_key
+        s.model_download_busy = True
+        s.model_download_progress.setValue(0); s.model_download_progress.show()
+        s.model_download_note.setText(f"模型 {model_key}：正在准备下载…")
+        s.refresh_vocal_model_controls()
+        worker = ModelDownloadWorker(model_key, s)
+        s.model_download_worker = worker
+        worker.progress.connect(s.model_download_progress.setValue)
+        worker.status.connect(s.model_download_note.setText)
+        worker.completed.connect(s.model_download_succeeded)
+        worker.failed.connect(s.model_download_failed)
+        worker.finished.connect(s.model_download_thread_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def model_download_succeeded(s, message):
+        s.model_download_busy = False; s.model_download_key = None
+        s.model_download_progress.setValue(100); s.model_download_progress.show()
+        s.model_download_note.setText(message)
+        s.refresh_vocal_model_controls()
+        s.statusBar().showMessage(message, 8000)
+
+    def model_download_failed(s, message):
+        key = s.model_download_key or s.st.get("vocal_model", "A")
+        s.model_download_busy = False; s.model_download_key = None
+        s.model_download_progress.setValue(0); s.model_download_progress.show()
+        s.model_download_note.setText(f"模型 {key} 下载失败，可点击‘下载’重试。")
+        s.refresh_vocal_model_controls()
+        QMessageBox.warning(s, "模型下载失败", message)
+
+    def model_download_thread_finished(s):
+        s.model_download_worker = None
+        s.refresh_vocal_model_controls()
+
+    def check_selected_vocal_model(s):
+        if s.model_download_busy:
+            QMessageBox.information(s, "请稍候", "模型下载完成后再开始识别。")
+            return False
+        if not any(is_vocal_model_downloaded(key) for key in VOCAL_MODELS):
+            s.tabs.setCurrentIndex(0)
+            QMessageBox.information(s, "需要下载模型", "首次使用前，请在右侧‘设置’中至少下载一个人声分离模型。")
+            return False
+        model_key = s.st.get("vocal_model", "A")
+        if not is_vocal_model_downloaded(model_key):
+            s.tabs.setCurrentIndex(0)
+            QMessageBox.information(s, "所选模型尚未下载", f"当前选择的是模型 {model_key}，请点击它旁边的‘下载’并等待完成。")
+            return False
+        return True
 
     def setts(s, k, v): s.st["title_style"][k]=v; s.preview.update()
 
@@ -1125,12 +2738,27 @@ class Main(QMainWindow):
 
     def run_asr(s):
         if not s.path: return QMessageBox.information(s, "提示", "先导入音频")
-        s.btn_asr.setEnabled(False); s.bar.setValue(0)
+        if not s.check_selected_vocal_model(): return
+        if not s.check_selected_asr_model(): return
+        engine=s.st.get("asr_engine","A"); model_key=s.selected_asr_model(engine); cloud_consent=False
+        if engine=="D":
+            answer=QMessageBox.warning(
+                s,"剪映云端识别 / 音频上传告知",
+                "剪映 D 不是本地模型。继续后，本次分离出的人声音频将上传至字节跳动相关云端存储/API；"
+                "签名还会请求 AsrTools 项目使用的第三方签名服务。该接口为非官方方案，可能失效。"
+                "请勿处理含敏感或未获授权的音频。是否仅为本次任务同意上传？",
+                QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+            if answer!=QMessageBox.Yes: return
+            cloud_consent=True
+        s.asr_running = True; s.refresh_vocal_model_controls(); s.refresh_asr_controls(); s.bar.setValue(0)
         order = s.get_order()
         s.worker = Worker(s.path, s.lyrics.toPlainText(), s.rap.isChecked(), order,
-                          s.bpm_sp.value(), s.off_sp.value(), int(s.an_grid_cb.currentText()), s.pinyin_fix.isChecked())
+                          s.bpm_sp.value(), s.off_sp.value(), int(s.an_grid_cb.currentText()), s.pinyin_fix.isChecked(),
+                          separator_model=s.st.get("vocal_model", "A"), asr_engine=engine,
+                          asr_model=model_key, cloud_consent=cloud_consent)
         s.worker.lab.connect(s.set_cells); s.worker.found.connect(s.set_bpm)
         s.worker.prog.connect(s.bar.setValue); s.worker.lyr.connect(s.lyrics.setPlainText)
+        s.worker.notice.connect(lambda msg: s.statusBar().showMessage(msg, 12000))
         s.worker.done.connect(s.asr_done); s.worker.err.connect(s.asr_err); s.worker.start()
 
     def get_order(s):
@@ -1150,10 +2778,13 @@ class Main(QMainWindow):
         w.start()
 
     def fin(s, r):
+        s.batch_running=False; s.refresh_vocal_model_controls()
         s.bar.setValue(100)
         QMessageBox.information(s, "完成", r if isinstance(r, str) else "批量完成" + ("\n失败:\n" + "\n".join(r) if r else ""))
 
-    def fail(s, m): QMessageBox.critical(s, "失败", m)
+    def fail(s, m):
+        s.batch_running=False; s.refresh_vocal_model_controls()
+        QMessageBox.critical(s, "失败", m)
 
     def export_mp4(s):
         if not s.path or not s.cues: return QMessageBox.information(s, "提示", "先导入音频并识别/添加字幕")
@@ -1161,6 +2792,17 @@ class Main(QMainWindow):
         if out: s.run_bg(RenderWorker(s.path, list(s.cues), dict(s.st), out))
 
     def batch(s):
+        if not s.check_selected_vocal_model(): return
+        if not s.check_selected_asr_model(): return
+        engine=s.st.get("asr_engine","A"); model_key=s.selected_asr_model(engine); cloud_consent=False
+        if engine=="D":
+            answer=QMessageBox.warning(
+                s,"剪映云端批量识别 / 音频上传告知",
+                "此批次每首歌分离出的人声音频都会上传至字节跳动相关云端存储/API；签名还会请求 AsrTools 项目使用的第三方签名服务。"
+                "这是非官方接口，可能失效。请勿处理敏感或未获授权的音频。是否同意本批次上传？",
+                QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+            if answer!=QMessageBox.Yes: return
+            cloud_consent=True
         in_dir=s.batch_in.text().strip(); out_dir=s.batch_out.text().strip()
         if in_dir:
             fs=[os.path.join(in_dir,n) for n in sorted(os.listdir(in_dir)) if n.lower().endswith((".mp3",".wav",".flac",".m4a",".ogg"))]
@@ -1169,11 +2811,18 @@ class Main(QMainWindow):
         if not fs: return QMessageBox.information(s,"批量生成","输入文件夹中没有找到音频文件")
         d=out_dir or QFileDialog.getExistingDirectory(s,"选择输出文件夹")
         if d:
-            s.batch_in.setText(os.path.dirname(fs[0]) if in_dir else in_dir); s.batch_out.setText(d); s.run_bg(BatchWorker(fs,d,dict(s.st),s.rap.isChecked(),s.get_order()))
+            s.batch_in.setText(os.path.dirname(fs[0]) if in_dir else in_dir); s.batch_out.setText(d)
+            s.batch_running=True; s.refresh_vocal_model_controls(); s.refresh_asr_controls()
+            s.run_bg(BatchWorker(fs,d,dict(s.st),s.rap.isChecked(),s.get_order(),
+                                 s.st.get("vocal_model","A"),engine,model_key,cloud_consent))
 
     def closeEvent(s, e):
-        try: json.dump(s.st, open(STYLE_FILE, "w", encoding="utf-8"), ensure_ascii=False)
-        except Exception: pass
+        workers=[s.model_download_worker,s.asr_download_worker,s.gpu_worker,
+                 getattr(s,"worker",None),getattr(s,"job",None)]
+        if any(worker is not None and worker.isRunning() for worker in workers):
+            QMessageBox.information(s, "任务进行中", "模型下载、GPU 检测、ASR 上传/识别或导出仍在运行，请等待结束后再退出。")
+            e.ignore(); return
+        s.save_settings()
         super().closeEvent(e)
 
     def set_cells(s, c): s.cells = c; s.tl.update()
@@ -1188,11 +2837,11 @@ class Main(QMainWindow):
 
     def asr_done(s, cues):
         s.sync_audio_duration(); s.cues = [c for c in s.cues if c.track != 0] + cues; s.refill()
-        s.bar.setValue(100); s.btn_asr.setEnabled(True)
-        s.info.setText(f"识别完成: {len(cues)} 句字幕 | 拼音纠正 {getattr(s.worker,'fixed_count',0)} 句 | BPM {s.bpm_sp.value():.1f}")
+        s.asr_running=False; s.bar.setValue(100); s.refresh_vocal_model_controls(); s.refresh_asr_controls()
+        s.info.setText(f"识别完成: {len(cues)} 句字幕 | 引擎 {s.st.get('asr_engine','A')} | 拼音纠正 {getattr(s.worker,'fixed_count',0)} 句 | BPM {s.bpm_sp.value():.1f}")
 
     def asr_err(s, m):
-        s.btn_asr.setEnabled(True); QMessageBox.critical(s, "识别失败", m)
+        s.asr_running=False; s.refresh_vocal_model_controls(); s.refresh_asr_controls(); QMessageBox.critical(s, "识别失败", m)
 
 
 if __name__ == "__main__":
